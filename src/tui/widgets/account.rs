@@ -27,8 +27,7 @@ use super::styled_title;
 pub enum AddMode {
     #[default]
     None,
-    // type picker; `selected` is the highlighted row (0 = Microsoft, 1 = offline)
-    ChooseType { selected: usize },
+    ChooseType,
     // offline username entry; `cursor` is a char index into `name`
     OfflineNameInput { name: String, cursor: usize },
     OfflineBlocked,
@@ -97,36 +96,14 @@ impl AccountState {
 
 pub fn handle_key(key_event: &KeyEvent, state: &mut AccountState) -> bool {
     match &state.add_mode {
-        AddMode::ChooseType { selected } => {
-            let selected = *selected;
-            match key_event.code {
-                KeyCode::Char('m') | KeyCode::Char('1') => start_microsoft_auth_mode(state),
-                KeyCode::Char('o') | KeyCode::Char('2') => choose_offline_mode(state),
-                KeyCode::Enter => {
-                    if selected == 0 {
-                        start_microsoft_auth_mode(state)
-                    } else {
-                        choose_offline_mode(state)
-                    }
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    state.add_mode = AddMode::ChooseType {
-                        selected: (selected + 1).min(1),
-                    };
-                    true
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.add_mode = AddMode::ChooseType {
-                        selected: selected.saturating_sub(1),
-                    };
-                    true
-                }
-                KeyCode::Esc => {
-                    state.add_mode = AddMode::None;
-                    true
-                }
-                _ => true,
+        AddMode::ChooseType => match key_event.code {
+            KeyCode::Char('m') | KeyCode::Char('1') => start_microsoft_auth_mode(state),
+            KeyCode::Char('o') | KeyCode::Char('2') => choose_offline_mode(state),
+            KeyCode::Esc => {
+                state.add_mode = AddMode::None;
+                true
             }
+            _ => true,
         }
         AddMode::OfflineNameInput { name, cursor } => {
             let name = name.clone();
@@ -229,7 +206,7 @@ pub fn handle_key(key_event: &KeyEvent, state: &mut AccountState) -> bool {
             let count = state.store.accounts.len();
             match key_event.code {
                 KeyCode::Char('a') => {
-                    state.add_mode = AddMode::ChooseType { selected: 0 };
+                    state.add_mode = AddMode::ChooseType;
                     true
                 }
                 KeyCode::Enter => {
@@ -307,10 +284,8 @@ pub fn render(frame: &mut Frame, area: Rect, focused: FocusedArea, state: &mut A
     }
 
     match &state.add_mode {
-        AddMode::ChooseType { selected } => render_choose_popup(frame, *selected),
-        AddMode::OfflineNameInput { name, cursor } => {
-            render_offline_popup(frame, name, *cursor)
-        }
+        AddMode::ChooseType => render_choose_popup(frame),
+        AddMode::OfflineNameInput { name, .. } => render_offline_popup(frame, name),
         AddMode::OfflineBlocked => render_offline_blocked_popup(frame),
         AddMode::DeviceCodeWaiting { info, .. } => render_device_code_popup(frame, info),
         AddMode::None => {}
@@ -435,7 +410,7 @@ fn popup_area(frame: &Frame, width: u16, height: u16) -> Rect {
     }
 }
 
-fn render_choose_popup(frame: &mut Frame, selected: usize) {
+fn render_choose_popup(frame: &mut Frame) {
     use super::popups::base::PopupFrame;
     let theme = THEME.as_ref();
     let area = popup_area(frame, 40, 7);
@@ -445,63 +420,48 @@ fn render_choose_popup(frame: &mut Frame, selected: usize) {
     let accent_color = theme.success();
     let text_color = theme.text();
 
-    let options = [("m", "Microsoft Account"), ("o", "Offline Account")];
-
     PopupFrame {
         title: Line::from(" Add Account ").centered(),
         border_color,
         bg: None,
         keybinds: Some(Line::from(Span::styled(
-            " ↑↓: choose, ⏎: confirm, Esc: cancel ",
+            " Esc: cancel ",
             Style::default().fg(dim_color),
         ))),
         search_line: None,
         content: Box::new(move |inner, buf| {
-            let mut text = vec![Line::from("")];
-            for (i, (key, label)) in options.iter().enumerate() {
-                let is_selected = i == selected;
-                let (marker, style) = if is_selected {
-                    (
-                        "▸ ",
+            let text = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(
+                        " [m] ",
                         Style::default()
                             .fg(accent_color)
                             .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    ("  ", Style::default().fg(dim_color))
-                };
-                text.push(Line::from(vec![
-                    Span::styled(marker, style),
-                    Span::styled(
-                        format!("[{key}] "),
-                        if is_selected {
-                            style
-                        } else {
-                            Style::default().fg(dim_color)
-                        },
                     ),
+                    Span::styled("Microsoft Account", Style::default().fg(text_color)),
+                ]),
+                Line::from(vec![
                     Span::styled(
-                        label.to_string(),
-                        if is_selected {
-                            Style::default().fg(text_color).add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(text_color)
-                        },
+                        " [o] ",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
-                ]));
-            }
+                    Span::styled("Offline Account", Style::default().fg(text_color)),
+                ]),
+            ];
             Paragraph::new(text).render(inner, buf);
         }),
     }
     .render(area, frame.buffer_mut());
 }
 
-fn render_offline_popup(frame: &mut Frame, name: &str, cursor: usize) {
+fn render_offline_popup(frame: &mut Frame, name: &str) {
     use super::popups::{base::PopupFrame, keybind_line};
     let theme = THEME.as_ref();
     let area = popup_area(frame, 40, 5);
     let name = name.to_string();
-    let cursor = cursor.min(name.chars().count());
 
     let border_color = theme.text_dim();
     let bg_color = theme.surface();
@@ -518,11 +478,7 @@ fn render_offline_popup(frame: &mut Frame, name: &str, cursor: usize) {
         .centered(),
         border_color,
         bg: Some(bg_color),
-        keybinds: Some(keybind_line(&[
-            ("←→", " move"),
-            ("Enter", " confirm"),
-            ("Esc", " cancel"),
-        ])),
+        keybinds: Some(keybind_line(&[("Enter", " confirm"), ("Esc", " cancel")])),
         search_line: None,
         content: Box::new(move |inner, buf| {
             let line = if name.is_empty() {
@@ -536,33 +492,15 @@ fn render_offline_popup(frame: &mut Frame, name: &str, cursor: usize) {
                     ),
                 ])
             } else {
-                let byte_idx = char_byte_index(&name, cursor);
-                let (before, after) = name.split_at(byte_idx);
-                let mut spans = vec![Span::styled(
-                    before.to_string(),
-                    Style::default().fg(text_color),
-                )];
-                // block cursor: inverts the char it sits on, or blinks at
-                // the end of the input
-                match after.chars().next() {
-                    Some(ch) => {
-                        spans.push(Span::styled(
-                            ch.to_string(),
-                            Style::default().fg(bg_color).bg(text_color),
-                        ));
-                        spans.push(Span::styled(
-                            after[ch.len_utf8()..].to_string(),
-                            Style::default().fg(text_color),
-                        ));
-                    }
-                    None => spans.push(Span::styled(
+                Line::from(vec![
+                    Span::styled(name.as_str(), Style::default().fg(text_color)),
+                    Span::styled(
                         "\u{2588}",
                         Style::default()
                             .fg(border_color)
                             .add_modifier(Modifier::SLOW_BLINK),
-                    )),
-                }
-                Line::from(spans)
+                    ),
+                ])
             };
             Paragraph::new(line).render(inner, buf);
         }),
@@ -754,31 +692,10 @@ mod tests {
     }
 
     #[test]
-    fn choose_type_arrows_move_selection() {
-        let mut state = AccountState::default();
-        state.add_mode = AddMode::ChooseType { selected: 0 };
-        handle_key(&key(KeyCode::Down), &mut state);
-        assert!(matches!(
-            state.add_mode,
-            AddMode::ChooseType { selected: 1 }
-        ));
-        handle_key(&key(KeyCode::Down), &mut state);
-        assert!(matches!(
-            state.add_mode,
-            AddMode::ChooseType { selected: 1 }
-        ));
-        handle_key(&key(KeyCode::Up), &mut state);
-        assert!(matches!(
-            state.add_mode,
-            AddMode::ChooseType { selected: 0 }
-        ));
-    }
-
-    #[test]
     fn popup_open_tracks_add_mode() {
         let mut state = AccountState::default();
         assert!(!state.popup_open());
-        state.add_mode = AddMode::ChooseType { selected: 0 };
+        state.add_mode = AddMode::ChooseType;
         assert!(state.popup_open());
         state.add_mode = AddMode::OfflineNameInput {
             name: "d".into(),
