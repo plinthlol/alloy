@@ -360,7 +360,11 @@ impl App {
             }
         }
 
+        // only when no add-account popup is open — while the offline-name
+        // entry or the type chooser is up, 'd' belongs to the popup (e.g. a
+        // 'd' in the username), not to the delete hotkey.
         if self.focused == FocusedArea::Account
+            && !self.account_state.popup_open()
             && let KeyCode::Char('d') = key_event.code
             && let Some(index) = self.account_state.list_state.selected
             && let Some(account) = self.account_state.store.accounts.get(index)
