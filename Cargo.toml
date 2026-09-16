@@ -1,6 +1,6 @@
 [package]
 name = "alloy"
-version = "3.79.0"
+version = "3.80.0"
 authors = ["plinthlol"]
 edition = "2024"
 description = "A Minecraft launcher, Minimal but Featureful."

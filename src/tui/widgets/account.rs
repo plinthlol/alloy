@@ -285,7 +285,9 @@ pub fn render(frame: &mut Frame, area: Rect, focused: FocusedArea, state: &mut A
 
     match &state.add_mode {
         AddMode::ChooseType => render_choose_popup(frame),
-        AddMode::OfflineNameInput { name, .. } => render_offline_popup(frame, name),
+        AddMode::OfflineNameInput { name, cursor } => {
+            render_offline_popup(frame, name, *cursor)
+        }
         AddMode::OfflineBlocked => render_offline_blocked_popup(frame),
         AddMode::DeviceCodeWaiting { info, .. } => render_device_code_popup(frame, info),
         AddMode::None => {}
@@ -421,9 +423,15 @@ fn render_choose_popup(frame: &mut Frame) {
     let text_color = theme.text();
 
     PopupFrame {
-        title: Line::from(" Add Account ").centered(),
+        title: Line::from(Span::styled(
+            " Add Account ",
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
         border_color,
-        bg: None,
+        bg: Some(theme.surface()),
         keybinds: Some(Line::from(Span::styled(
             " Esc: cancel ",
             Style::default().fg(dim_color),
@@ -457,11 +465,12 @@ fn render_choose_popup(frame: &mut Frame) {
     .render(area, frame.buffer_mut());
 }
 
-fn render_offline_popup(frame: &mut Frame, name: &str) {
+fn render_offline_popup(frame: &mut Frame, name: &str, cursor: usize) {
     use super::popups::{base::PopupFrame, keybind_line};
     let theme = THEME.as_ref();
     let area = popup_area(frame, 40, 5);
     let name = name.to_string();
+    let cursor = cursor.min(name.chars().count());
 
     let border_color = theme.text_dim();
     let bg_color = theme.surface();
@@ -492,15 +501,33 @@ fn render_offline_popup(frame: &mut Frame, name: &str) {
                     ),
                 ])
             } else {
-                Line::from(vec![
-                    Span::styled(name.as_str(), Style::default().fg(text_color)),
-                    Span::styled(
+                // block cursor drawn at the stored position: inverts the
+                // char it sits on, blinks at the end of the input
+                let byte_idx = char_byte_index(&name, cursor);
+                let (before, after) = name.split_at(byte_idx);
+                let mut spans = vec![Span::styled(
+                    before.to_string(),
+                    Style::default().fg(text_color),
+                )];
+                match after.chars().next() {
+                    Some(ch) => {
+                        spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(bg_color).bg(text_color),
+                        ));
+                        spans.push(Span::styled(
+                            after[ch.len_utf8()..].to_string(),
+                            Style::default().fg(text_color),
+                        ));
+                    }
+                    None => spans.push(Span::styled(
                         "\u{2588}",
                         Style::default()
                             .fg(border_color)
                             .add_modifier(Modifier::SLOW_BLINK),
-                    ),
-                ])
+                    )),
+                }
+                Line::from(spans)
             };
             Paragraph::new(line).render(inner, buf);
         }),
