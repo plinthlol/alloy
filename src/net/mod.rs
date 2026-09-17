@@ -203,6 +203,42 @@ impl HttpClient {
         .await
     }
 
+    // POST a JSON body and deserialize the JSON response, with the same
+    // retry/backoff envelope as get_json. used by hash-lookup endpoints
+    // (Modrinth's POST /v2/version_files) where the query is too large
+    // for a GET.
+    pub async fn post_json<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+    ) -> Result<T, NetError> {
+        let url_owned = url.to_string();
+        // retry envelope mirrors get_with_retry, but through POST
+        for attempt in 0..=MAX_RETRIES {
+            match self.inner.post(url).json(body).send().await {
+                Ok(resp) => {
+                    let resp = ensure_success(resp)?;
+                    match decode_json_response(resp, url_owned.clone()).await {
+                        Ok(value) => return Ok(value),
+                        Err(e) if is_retryable(&e) && attempt < MAX_RETRIES => {
+                            sleep_before_retry("request", url, attempt, &e).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => {
+                    let err = NetError::from(e);
+                    if is_retryable(&err) && attempt < MAX_RETRIES {
+                        sleep_before_retry("request", url, attempt, &err).await;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        unreachable!("retry loop returns on success or final error")
+    }
+
     // header-carrying counterpart to `get_json`, retried the same way.
     pub async fn get_json_with_headers<T: DeserializeOwned>(
         &self,
@@ -394,6 +430,23 @@ where
         }
     }
     unreachable!("retry loop returns on success or final error")
+}
+
+// turns a non-2xx response into a NetError::StatusError (capturing
+// Retry-After for the backoff logic). POST callers share this with the
+// GET paths.
+fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response, NetError> {
+    if !response.status().is_success() {
+        let retry_after = parse_retry_after(&response);
+        let url = response.url().to_string();
+        tracing::debug!("HTTP request {} returned non-success status {}", url, response.status());
+        return Err(NetError::StatusError {
+            status: response.status().as_u16(),
+            url,
+            retry_after,
+        });
+    }
+    Ok(response)
 }
 
 async fn decode_json_response<T: DeserializeOwned>(

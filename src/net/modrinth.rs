@@ -338,6 +338,35 @@ pub async fn get_version_from(
     client.get_json(&url).await
 }
 
+// maps file hashes (sha1, lowercase hex) to the Modrinth version that
+// provides them, via the batch `POST /v2/version_files` endpoint. used by
+// modpack installs: mrpack entries carry no project id, only download
+// urls, and hashing each downloaded file is the reliable way to recover
+// the (project, version) identity the installed-content sidecar tracks.
+// hashes absent from Modrinth are simply missing from the returned map.
+pub async fn lookup_versions_by_sha1(
+    client: &HttpClient,
+    sha1s: &[String],
+) -> Result<HashMap<String, ProjectVersion>, NetError> {
+    lookup_versions_by_sha1_from(client, MODRINTH_API_BASE, sha1s).await
+}
+
+pub async fn lookup_versions_by_sha1_from(
+    client: &HttpClient,
+    api_base: &str,
+    sha1s: &[String],
+) -> Result<HashMap<String, ProjectVersion>, NetError> {
+    if sha1s.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // request shape per API docs: {"hashes": [...], "algorithm": "sha1"}
+    // ("fingerprints" is for murmur/sha1-of-sha1 lookups instead).
+    let url = format!("{api_base}/version_files");
+    let body = serde_json::json!({ "hashes": sha1s, "algorithm": "sha1" });
+    let map: HashMap<String, ProjectVersion> = client.post_json(&url, &body).await?;
+    Ok(map)
+}
+
 // downloads a version's primary file (first file as fallback — modrinth
 // always flags one, but don't trust that blindly) to `dest`. used for plain
 // mod jars and `.mrpack` files alike.

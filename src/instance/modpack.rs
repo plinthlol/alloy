@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -167,11 +167,20 @@ pub async fn install_from_modrinth(
     let total = downloads.len();
     progress(&format!("Downloading {total} mods..."));
 
+    // sha1 per file so the batch hash lookup afterwards can map each
+    // downloaded file back to its Modrinth (project, version) identity —
+    // mrpack entries carry only URLs, and the installed-content sidecar
+    // tracks project ids ("modrinth:<id>"), not file names. collected
+    // through a mutex because download tasks own their dest path.
+    let downloaded_hashes: Arc<Mutex<Vec<(PathBuf, String)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
     let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
     let mut join_set: JoinSet<Result<(), NetError>> = JoinSet::new();
     for (url, dest) in downloads {
         let client = client.clone();
         let semaphore = semaphore.clone();
+        let downloaded_hashes = downloaded_hashes.clone();
         join_set.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
@@ -180,7 +189,17 @@ pub async fn install_from_modrinth(
             if let Some(parent) = dest.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            download_file(&client, &url, &dest, |_, _| {}).await
+            download_file(&client, &url, &dest, |_, _| {}).await?;
+            // hash what we just wrote: modrinth.index.json carries no sha1
+            // to compare against, this hash is purely the lookup key for
+            // the version_files batch call below. a read failure just means
+            // no identity record for this file — not worth failing the pack.
+            if let Ok(bytes) = tokio::fs::read(&dest).await {
+                if let Ok(mut hashes) = downloaded_hashes.lock() {
+                    hashes.push((dest, sha1_hex(&bytes)));
+                }
+            }
+            Ok(())
         });
     }
 
@@ -201,6 +220,40 @@ pub async fn install_from_modrinth(
             Err(_) => {
                 // task was cancelled (e.g. by our own abort_all from a
                 // sibling task's failure) - nothing more to do with it.
+            }
+        }
+    }
+
+    // recover each file's Modrinth project identity via the batch hash
+    // lookup and record it, so pack-installed mods show the "installed"
+    // badge in the browse popup and get replaced (not duplicated) when a
+    // newer version is installed later. purely bookkeeping: a failed
+    // lookup leaves that mod untracked but the pack itself still installs.
+    let hashes = downloaded_hashes
+        .lock()
+        .map(|guard| guard.clone())
+        .unwrap_or_default();
+    if !hashes.is_empty() {
+        progress("Identifying installed mods...");
+        let sha1s: Vec<String> = hashes.iter().map(|(_, h)| h.clone()).collect();
+        match modrinth::lookup_versions_by_sha1(&client, &sha1s).await {
+            Ok(version_by_hash) => {
+                let entries: Vec<(PathBuf, String, String)> = hashes
+                    .iter()
+                    .filter_map(|(dest, hash)| {
+                        let version = version_by_hash.get(hash)?;
+                        let filename = dest.file_name()?.to_str()?.to_string();
+                        let dir = dest.parent()?.to_path_buf();
+                        Some((dir, format!("modrinth:{}", version.project_id), filename))
+                    })
+                    .collect();
+                crate::instance::content::installed_meta::record_many(&entries);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Modrinth hash lookup failed; pack mods won't be tracked as installed: {}",
+                    e
+                );
             }
         }
     }
@@ -328,6 +381,14 @@ pub async fn install_from_curseforge(
     let total = manifest.files.len();
     progress(&format!("Resolving and downloading {total} mods..."));
 
+    // (content dir, project key, filename) triples gathered by the download
+    // tasks, recorded into the installed-content sidecar once the pack is
+    // in — the sidecar is what makes the browse popup show "installed" and
+    // lets a later single-mod install replace the pack's copy instead of
+    // adding a second one.
+    let recorded_files: Arc<Mutex<Vec<(PathBuf, String, String)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
     let semaphore = Arc::new(Semaphore::new(DOWNLOAD_CONCURRENCY));
     let mut join_set: JoinSet<Result<(), NetError>> = JoinSet::new();
     for entry in manifest.files {
@@ -335,6 +396,7 @@ pub async fn install_from_curseforge(
         let semaphore = semaphore.clone();
         let api_key = api_key.to_owned();
         let mods_dir = mods_dir.clone();
+        let recorded_files = recorded_files.clone();
         join_set.spawn(async move {
             let _permit = semaphore
                 .acquire_owned()
@@ -376,6 +438,17 @@ pub async fn install_from_curseforge(
                     "Skipping '{}' - author has disabled third-party downloads for this file",
                     mod_file.file_name
                 );
+            } else if let Some(parent) = dest.parent() {
+                // mod_id is the CF project id the manifest's projectID
+                // refers to, carried on every resolved file — same key shape
+                // single-mod installs record ("curseforge:<project>").
+                if let Ok(mut pending) = recorded_files.lock() {
+                    pending.push((
+                        parent.to_path_buf(),
+                        format!("curseforge:{}", mod_file.mod_id),
+                        mod_file.file_name.clone(),
+                    ));
+                }
             }
             Ok(())
         });
@@ -406,9 +479,25 @@ pub async fn install_from_curseforge(
     let overrides_prefix = format!("{}/", manifest.overrides.trim_end_matches('/'));
     extract_prefixed(&mut archive, &overrides_prefix, &instance_dir)?;
 
+    if let Ok(recorded) = recorded_files.lock() {
+        crate::instance::content::installed_meta::record_many(&recorded);
+    }
+
     let _ = std::fs::remove_dir_all(&tmp_dir);
 
     Ok(instance)
+}
+
+// lowercase hex sha1 of `bytes`, for Modrinth's version_files hash lookup.
+fn sha1_hex(bytes: &[u8]) -> String {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn extract_prefixed(
@@ -542,6 +631,15 @@ mod tests {
     #[test]
     fn sanitize_replaces_unsafe_chars() {
         assert_eq!(sanitize("a/b c.d"), "a_b_c_d");
+    }
+
+    #[test]
+    fn sha1_hex_matches_known_digest() {
+        // sha1("abc") per FIPS 180-1
+        assert_eq!(
+            sha1_hex(b"abc"),
+            "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
     }
 
     #[test]

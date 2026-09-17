@@ -181,6 +181,33 @@ pub fn confirm_installed(key: &str, filename: &str) {
     crate::tui::request_redraw();
 }
 
+// re-reads the installed-content sidecar into the open browse popup after
+// something outside an install changed it (a mod deleted from the content
+// tab). no-op when the popup is closed, or when it's open for a different
+// instance's dir than the one that changed.
+pub fn refresh_installed(content_dir: &std::path::Path) {
+    let Ok(mut state) = BROWSE_STATE.lock() else {
+        return;
+    };
+    if !state.open || state.dest_dir != content_dir {
+        return;
+    }
+    // "pending" placeholders mark in-flight installs that haven't landed
+    // on disk (or in the sidecar) yet; the fresh read knows nothing about
+    // them, so carry them over or badges would flicker off mid-download.
+    let pending_keys: Vec<String> = state
+        .installed
+        .iter()
+        .filter(|(_, f)| f.as_str() == "pending")
+        .map(|(k, _)| k.clone())
+        .collect();
+    state.installed = crate::instance::content::installed_meta::load(content_dir);
+    for key in pending_keys {
+        state.installed.entry(key).or_insert_with(|| "pending".to_string());
+    }
+    crate::tui::request_redraw();
+}
+
 // opens the popup for a specific instance's mods/resourcepacks dir — called
 // from the global keybind handler when 'b' is pressed on a content tab.
 pub fn open(kind: ContentKind, instance_name: String, dest_dir: PathBuf, game_version: String, loader: ModLoader) {

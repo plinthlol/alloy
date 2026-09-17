@@ -421,6 +421,34 @@ impl ContentListState {
             for stem in &diff.removed {
                 self.display_metadata.remove(stem);
             }
+            // files deleted outside an install (user's file manager, another
+            // launcher, rm) may be ones the installed-content sidecar tracks
+            // for a catalog project — clear those records so the browse
+            // popup doesn't keep an "installed" badge for a ghost file.
+            if let Some(dir) = self.watched_dir.as_deref() {
+                let stems: Vec<String> = diff
+                    .removed
+                    .iter()
+                    .filter(|stem| {
+                        // only entries actually gone from disk; a "removal"
+                        // that's really a rename (enable/disable toggle)
+                        // reappears with the other spelling in the same diff
+                        !dir.join(format!("{stem}{}", self.content_ext.unwrap_or(".jar")))
+                            .exists()
+                            && !dir
+                                .join(format!(
+                                    "{stem}{}.disabled",
+                                    self.content_ext.unwrap_or(".jar")
+                                ))
+                                .exists()
+                    })
+                    .cloned()
+                    .collect();
+                if !stems.is_empty() {
+                    crate::instance::content::installed_meta::remove_stems(dir, &stems);
+                    crate::tui::widgets::popups::content_browse::refresh_installed(dir);
+                }
+            }
         }
 
         // insert new entries in sorted position

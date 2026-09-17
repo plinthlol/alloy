@@ -99,6 +99,7 @@ impl App {
                             match delete_content_path(&path) {
                                 Ok(()) => {
                                     self.remove_content_path_from_states(&path);
+                                    self.forget_installed_meta(&path);
                                 }
                                 Err(e) => {
                                     tracing::error!("Failed to delete content '{}': {}", name, e);
@@ -540,6 +541,21 @@ impl App {
         }
 
         Ok(())
+    }
+
+    // a content file the user deleted (mods tab 'd', resource packs, etc.)
+    // may be the file the installed-content sidecar associates with a
+    // catalog project — drop that record so the browse popup stops showing
+    // an "installed" badge for something that no longer exists. dirs
+    // (worlds) and log files are never tracked, so they're skipped by the
+    // mods/resourcepacks parent check inside.
+    fn forget_installed_meta(&self, deleted_path: &std::path::Path) {
+        let Some((content_dir, stem)) = crate::instance::content::installed_meta::content_dir_and_stem(deleted_path)
+        else {
+            return;
+        };
+        crate::instance::content::installed_meta::remove_stems(&content_dir, &[stem]);
+        content_browse::refresh_installed(&content_dir);
     }
 
     fn remove_content_path_from_states(&mut self, path: &std::path::Path) {

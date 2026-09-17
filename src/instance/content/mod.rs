@@ -9,6 +9,7 @@ pub mod mods;
 pub mod resource_packs;
 pub mod worlds;
 
+pub use installed_meta::{content_dir_and_stem, record_many, remove_stems};
 pub use mods::scan_one_mod;
 pub use mods::{
     ContentEntry, IconCell, fallback_icon, make_icon_pixels_from_image, make_icon_quadrants_from_image,
