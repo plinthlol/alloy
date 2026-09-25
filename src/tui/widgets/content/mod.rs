@@ -112,18 +112,7 @@ impl ContentArea {
                 }
                 had
             }
-            ContentTab::Logs => {
-                let had = !self.logs.search.is_empty()
-                    || !self.logs.viewer_search.is_empty();
-                self.logs.search.deactivate();
-                self.logs.viewer_search.deactivate();
-                if had {
-                    self.logs.list_state.selected = Some(0);
-                    self.logs.viewer_focused = false;
-                    self.logs.update_scrollbar();
-                }
-                had
-            }
+            ContentTab::Logs => self.logs.clear_search(),
             ContentTab::Settings => false,
         }
     }
@@ -164,5 +153,64 @@ impl ContentArea {
             }
             ContentTab::Settings => self.settings.is_at_top(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_search_returns_false_when_no_filter() {
+        let content = ContentArea::default();
+        assert!(!content.clear_search());
+    }
+
+    #[test]
+    fn clear_search_clears_mods_confirmed_filter() {
+        let mut content = ContentArea::default();
+        content.tab = ContentTab::Mods;
+        content.mods.search.activate();
+        content.mods.search.query = "fabric".to_string();
+        content.mods.search.confirm();
+        assert!(!content.mods.search.is_empty());
+
+        assert!(content.clear_search());
+        assert!(content.mods.search.is_empty());
+        assert!(!content.mods.search.active);
+    }
+
+    #[test]
+    fn clear_search_clears_screenshots_filter() {
+        let mut content = ContentArea::default();
+        content.tab = ContentTab::Screenshots;
+        content.screenshots.search.activate();
+        content.screenshots.search.query = "cave".to_string();
+        content.screenshots.search.confirm();
+        assert!(!content.screenshots.search.is_empty());
+
+        assert!(content.clear_search());
+        assert!(content.screenshots.search.is_empty());
+        assert!(!content.screenshots.search.active);
+        assert_eq!(content.screenshots.selected, 0);
+    }
+
+    #[test]
+    fn search_active_detects_mods_filter() {
+        let mut content = ContentArea::default();
+        content.tab = ContentTab::Mods;
+        assert!(!content.search_active());
+        content.mods.search.activate();
+        content.mods.search.query = "x".to_string();
+        content.mods.search.confirm();
+        assert!(content.search_active());
+        content.clear_search();
+        assert!(!content.search_active());
+    }
+
+    #[test]
+    fn search_active_false_for_settings() {
+        let content = ContentArea::default();
+        assert!(!content.search_active());
     }
 }

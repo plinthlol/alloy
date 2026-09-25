@@ -450,7 +450,10 @@ impl App {
                 match key_event.code {
                     KeyCode::Char('q') => self.exit = true,
                     KeyCode::Char('I') => self.focused = FocusedArea::Instances,
-                    KeyCode::Char('C') => {\n                    self.instances_state.clear_search();\n                    self.focused = FocusedArea::Content;\n                }
+                    KeyCode::Char('C') => {
+                        self.instances_state.clear_search();
+                        self.focused = FocusedArea::Content;
+                    }
                     KeyCode::Char('A') => self.focused = FocusedArea::Account,
                     KeyCode::Char('O') => {
                         self.pre_overlay_focused = self.focused;
