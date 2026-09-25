@@ -465,4 +465,38 @@ mod tests {
             .unwrap();
 
     }
+
+    #[test]
+    fn clear_search_returns_false_when_no_filter() {
+        let mut state = State::default();
+        assert!(!state.clear_search());
+        assert!(!state.search.active);
+    }
+
+    #[test]
+    fn clear_search_clears_confirmed_sidebar_filter() {
+        let mut state = State::default();
+        state.search.activate();
+        state.search.query = "forge".to_string();
+        state.search.confirm();
+        assert!(!state.search.is_empty());
+        assert!(!state.search.active);
+
+        assert!(state.clear_search());
+        assert!(state.search.is_empty());
+        assert!(!state.search.active);
+    }
+
+    #[test]
+    fn clear_search_clears_active_edit() {
+        let mut state = State::default();
+        state.search.activate();
+        state.search.push('f');
+        state.search.push('o');
+        assert!(state.search.active);
+
+        assert!(state.clear_search());
+        assert!(state.search.is_empty());
+        assert!(!state.search.active);
+    }
 }

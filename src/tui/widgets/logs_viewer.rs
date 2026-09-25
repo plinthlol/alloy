@@ -78,6 +78,22 @@ impl LogsState {
         }
     }
 
+    /// Clears both the file-list and viewer search filters, returning true
+    /// if either had a non-empty query. Resets the list selection to the top
+    /// and exits the viewer pane if it was open, so the unfiltered file list
+    /// is what's shown next.
+    pub fn clear_search(&mut self) -> bool {
+        let had = !self.search.is_empty() || !self.viewer_search.is_empty();
+        self.search.deactivate();
+        self.viewer_search.deactivate();
+        if had {
+            self.list_state.selected = Some(0);
+            self.viewer_focused = false;
+            self.update_scrollbar();
+        }
+        had
+    }
+
     // true when the file list is showing and the selection is already at the
     // top. false while inside the log viewer, since k/Up there scrolls log
     // content instead. used to trigger instance rename from the content

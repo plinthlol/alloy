@@ -1636,7 +1636,7 @@ fn read_dir_stems(dir: &std::path::Path, ext: &str) -> StemMap {
 
 #[cfg(test)]
 mod tests {
-    use super::square_icon_columns;
+    use super::{square_icon_columns, ContentListState};
 
     #[test]
     fn square_columns_follow_terminal_cell_ratio() {
@@ -1648,5 +1648,51 @@ mod tests {
     #[test]
     fn square_columns_handle_missing_cell_size() {
         assert_eq!(square_icon_columns(3, (0, 0)), 3);
+    }
+
+    #[test]
+    fn clear_search_returns_false_when_no_filter() {
+        let mut state = ContentListState::default();
+        assert!(!state.clear_search());
+        assert!(!state.search.active);
+    }
+
+    #[test]
+    fn clear_search_clears_confirmed_filter() {
+        let mut state = ContentListState::default();
+        state.search.activate();
+        state.search.query = "foo".to_string();
+        state.search.confirm(); // active=false, query="foo"
+        assert!(!state.search.is_empty());
+        assert!(!state.search.active);
+
+        assert!(state.clear_search());
+        assert!(state.search.is_empty());
+        assert!(!state.search.active);
+        assert_eq!(state.list_state.selected, Some(0));
+    }
+
+    #[test]
+    fn clear_search_clears_active_edit() {
+        let mut state = ContentListState::default();
+        state.search.activate();
+        state.search.push('a');
+        state.search.push('b');
+        assert!(state.search.active);
+        assert!(!state.search.is_empty());
+
+        assert!(state.clear_search());
+        assert!(state.search.is_empty());
+        assert!(!state.search.active);
+    }
+
+    #[test]
+    fn clear_search_second_call_returns_false() {
+        let mut state = ContentListState::default();
+        state.search.activate();
+        state.search.push('x');
+        state.search.confirm();
+        assert!(state.clear_search());
+        assert!(!state.clear_search()); // already cleared
     }
 }
