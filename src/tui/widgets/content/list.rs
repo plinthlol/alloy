@@ -149,6 +149,21 @@ impl ContentListState {
         self.cache.remove(name);
     }
 
+    /// Clears the search filter (whether actively editing or just retained
+    /// after Enter), returning true if a non-empty query was cleared.
+    /// Resets selection to the top so the unfiltered list starts from the
+    /// first row — matching the search-key handler's behavior on Esc /
+    /// deactivate.
+    pub fn clear_search(&mut self) -> bool {
+        let had = !self.search.is_empty();
+        self.search.deactivate();
+        if had {
+            self.list_state.selected = Some(0);
+            self.update_scrollbar();
+        }
+        had
+    }
+
     // true when the selection is already at (or before) the first row, i.e.
     // pressing "up" again wouldn't move it. used to trigger instance rename
     // from the content header when the user keeps pressing k/Up past the top.

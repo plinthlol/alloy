@@ -94,6 +94,56 @@ impl ContentArea {
         self.screenshots.invalidate_protocols();
     }
 
+    /// Clears the search filter on the currently active tab, returning true
+    /// if a non-empty filter was actually cleared. Selection resets to the
+    /// top of the now-unfiltered list. Called from:
+    /// - Esc in a content tab (priority over the global kill binding)
+    /// - switching tabs (so a filter doesn't persist across tabs)
+    pub fn clear_search(&mut self) -> bool {
+        match self.tab {
+            ContentTab::Mods => self.mods.clear_search(),
+            ContentTab::ResourcePacks => self.resource_packs.clear_search(),
+            ContentTab::Worlds => self.worlds.clear_search(),
+            ContentTab::Screenshots => {
+                let had = !self.screenshots.search.is_empty();
+                self.screenshots.search.deactivate();
+                if had {
+                    self.screenshots.selected = 0;
+                }
+                had
+            }
+            ContentTab::Logs => {
+                let had = !self.logs.search.is_empty()
+                    || !self.logs.viewer_search.is_empty();
+                self.logs.search.deactivate();
+                self.logs.viewer_search.deactivate();
+                if had {
+                    self.logs.list_state.selected = Some(0);
+                    self.logs.viewer_focused = false;
+                    self.logs.update_scrollbar();
+                }
+                had
+            }
+            ContentTab::Settings => false,
+        }
+    }
+
+    /// Returns true if the active tab has a non-empty search filter
+    /// (whether the search box is open or the filter is just retained after
+    /// Enter). Used by the tab footer to swap the Esc binding label.
+    pub fn search_active(&self) -> bool {
+        match self.tab {
+            ContentTab::Mods => !self.mods.search.is_empty(),
+            ContentTab::ResourcePacks => !self.resource_packs.search.is_empty(),
+            ContentTab::Worlds => !self.worlds.search.is_empty(),
+            ContentTab::Screenshots => !self.screenshots.search.is_empty(),
+            ContentTab::Logs => {
+                !self.logs.search.is_empty() || !self.logs.viewer_search.is_empty()
+            }
+            ContentTab::Settings => false,
+        }
+    }
+
     /// true when the active tab's selection is already at the top (or the
     /// list is empty), meaning another k/Up should open the instance rename
     /// field in the content header instead of moving the selection.

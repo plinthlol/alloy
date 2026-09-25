@@ -359,6 +359,14 @@ impl App {
                     }
                 }
             }
+
+            // Esc clears an active content search filter, taking priority over
+            // the global Esc (kill running instance). Only fires when a filter
+            // exists (confirmed search with a non-empty query after Enter);
+            // Esc-while-typing is already consumed by the tab handlers above.
+            if key_event.code == KeyCode::Esc && self.content.clear_search() {
+                return Ok(());
+            }
         }
 
         // only when no add-account popup is open — while the offline-name
@@ -429,11 +437,20 @@ impl App {
                     return Ok(());
                 }
 
+                // Esc clears a confirmed (but not actively-editing) sidebar
+                // search before falling through to the global kill binding —
+                // same priority inversion as the content area.
+                if key_event.code == KeyCode::Esc
+                    && self.instances_state.clear_search()
+                {
+                    return Ok(());
+                }
+
                 // global keybindings (uppercase = area switch, lowercase = action)
                 match key_event.code {
                     KeyCode::Char('q') => self.exit = true,
                     KeyCode::Char('I') => self.focused = FocusedArea::Instances,
-                    KeyCode::Char('C') => self.focused = FocusedArea::Content,
+                    KeyCode::Char('C') => {\n                    self.instances_state.clear_search();\n                    self.focused = FocusedArea::Content;\n                }
                     KeyCode::Char('A') => self.focused = FocusedArea::Account,
                     KeyCode::Char('O') => {
                         self.pre_overlay_focused = self.focused;
@@ -442,11 +459,13 @@ impl App {
                     KeyCode::Tab | KeyCode::Char('l') | KeyCode::Right
                         if self.focused == FocusedArea::Content =>
                     {
+                        self.content.clear_search();
                         self.content.tab = self.content.tab.next();
                     }
                     KeyCode::BackTab | KeyCode::Char('h') | KeyCode::Left
                         if self.focused == FocusedArea::Content =>
                     {
+                        self.content.clear_search();
                         self.content.tab = self.content.tab.previous();
                     }
                     KeyCode::Char('b')
@@ -502,6 +521,7 @@ impl App {
                         if self.focused == FocusedArea::Instances
                             && !self.instances_state.search.active =>
                     {
+                        self.instances_state.clear_search();
                         self.focused = FocusedArea::Content;
                     }
                     KeyCode::Char('r')

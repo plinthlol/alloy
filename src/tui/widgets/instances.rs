@@ -168,6 +168,19 @@ impl State {
         self.show_popup
     }
 
+    /// Clears the search filter, returning true if a non-empty query was
+    /// cleared. Resets selection to the top. Called from Esc (priority over
+    /// kill) and from focus switches to other areas.
+    pub fn clear_search(&mut self) -> bool {
+        let had = !self.search.is_empty();
+        self.search.deactivate();
+        if had {
+            self.list_state.selected = Some(0);
+            self.update_scrollbar();
+        }
+        had
+    }
+
     pub fn remove_instance(&mut self, name: &str) {
         let before = self.instances.len();
         self.instances.retain(|i| i.name != name);
