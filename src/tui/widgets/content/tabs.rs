@@ -512,27 +512,12 @@ pub fn title(
                 }
                 Some(RunState::Orphaned(_)) => {
                     frame.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            Span::styled(
-                                "\u{25cf} ",
-                                // still actually running (just launched by a
-                                // previous alloy session we no longer have a
-                                // handle on) - same "playing" green as the
-                                // throbber above, not the warning color. it
-                                // used to render as warning/amber, which
-                                // reads as "something's wrong" when nothing
-                                // is: the game just keeps going fine.
-                                Style::default()
-                                    .fg(theme.success())
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(
-                                inst.name.as_str(),
-                                Style::default()
-                                    .fg(theme.text())
-                                    .add_modifier(Modifier::BOLD),
-                            ),
-                        ])),
+                        Paragraph::new(Span::styled(
+                            inst.name.as_str(),
+                            Style::default()
+                                .fg(theme.text())
+                                .add_modifier(Modifier::BOLD),
+                        )),
                         left_area,
                     );
                 }
