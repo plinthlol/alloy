@@ -7,6 +7,7 @@
 pub mod fabric;
 pub mod forge;
 pub mod curseforge;
+pub mod imgur;
 pub mod java_provision;
 pub mod mojang;
 pub mod modrinth;
@@ -115,7 +116,6 @@ impl HttpClient {
     }
 
     pub async fn get(&self, url: &str) -> Result<reqwest::Response, NetError> {
-        self.gate(url).await;
         self.gate(url).await;
         tracing::trace!("HTTP GET {}", url);
         let response = self.inner.get(url).send().await?;

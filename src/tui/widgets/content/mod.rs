@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn clear_search_returns_false_when_no_filter() {
-        let content = ContentArea::default();
+        let mut content = ContentArea::default();
         assert!(!content.clear_search());
     }
 

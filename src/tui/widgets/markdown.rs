@@ -100,12 +100,26 @@ enum ImageLoad {
     Failed,
 }
 
+impl DocumentImage {
+    /// the still currently held by `load`, for callers that need the
+    /// decoded image without disturbing an animation's frame clock.
+    fn load_image(&self) -> Option<&DynamicImage> {
+        match &self.load {
+            ImageLoad::Ready(decoded) => Some(decoded),
+            ImageLoad::Pending | ImageLoad::Failed => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ImageRenderKey {
     width: u16,
     height: u16,
     protocol: ProtocolType,
     mode: ImageProtocol,
+    // which frame of an animation this encodes. 0 for stills, so a still
+    // image's key is unchanged by the animation plumbing.
+    frame: usize,
 }
 
 struct PreparedImage {
@@ -123,6 +137,9 @@ struct DocumentImage {
     load: ImageLoad,
     prepared: Option<(ImageRenderKey, PreparedImage)>,
     pending: Option<ImageRenderKey>,
+    // multi-frame source, kept so an animated GIF/WebP can be re-prepared
+    // at whichever frame the clock lands on. `frames` is empty for stills.
+    animation: Option<Animation>,
 }
 
 impl Default for DocumentImage {
@@ -131,7 +148,84 @@ impl Default for DocumentImage {
             load: ImageLoad::Pending,
             prepared: None,
             pending: None,
+            animation: None,
         }
+    }
+}
+
+/// a decoded animation plus the clock that decides which frame to show.
+struct Animation {
+    frames: Vec<DynamicImage>,
+    delays_ms: Vec<u64>,
+    /// when the current frame started; `frame` is valid for this instant.
+    started: std::time::Instant,
+    frame: usize,
+}
+
+impl Animation {
+    fn new(animation: DecodedAnimation) -> Self {
+        Self {
+            frames: animation.frames,
+            delays_ms: animation.delays_ms,
+            started: std::time::Instant::now(),
+            frame: 0,
+        }
+    }
+
+    /// total time through one loop, so the frame clock can wrap cleanly
+    /// instead of accumulating per-frame drift.
+    fn loop_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.delays_ms
+                .iter()
+                .copied()
+                .filter(|delay| *delay > 0)
+                .sum::<u64>()
+                .max(1),
+        )
+    }
+
+    /// the frame to display at `now`, advancing the clock when the frame's
+    /// delay has elapsed. returns the frame index and whether the caller
+    /// must redraw.
+    fn frame_at(&mut self, now: std::time::Instant) -> (usize, bool) {
+        if self.frames.len() < 2 {
+            return (0, false);
+        }
+        let total = self.loop_duration();
+        let elapsed = now.saturating_duration_since(self.started);
+        let mut offset = elapsed.as_millis() as u64;
+        // past one full loop the per-frame walk is repeated from the top
+        offset %= total.as_millis() as u64;
+        let mut index = 0usize;
+        for (i, delay) in self.delays_ms.iter().enumerate() {
+            if offset < *delay {
+                index = i;
+                break;
+            }
+            offset -= *delay;
+            index = i;
+        }
+        let changed = index != self.frame;
+        self.frame = index;
+        (index, changed)
+    }
+
+    /// when the currently-shown frame is due to give way to the next one.
+    fn next_deadline(&self, now: std::time::Instant) -> std::time::Instant {
+        let total = self.loop_duration();
+        // re-base the clock each frame so long sessions can't drift
+        let base = self.started + std::time::Duration::from_nanos(
+            ((now.saturating_duration_since(self.started).as_nanos() / total.as_nanos())
+                * total.as_nanos()) as u64,
+        );
+        let delay = self
+            .delays_ms
+            .get(self.frame)
+            .copied()
+            .filter(|delay| *delay > 0)
+            .unwrap_or(100);
+        base + std::time::Duration::from_millis(delay)
     }
 }
 
@@ -184,6 +278,34 @@ impl Document {
         };
         image.prepared = None;
         image.pending = None;
+    }
+
+    /// installs a multi-frame decode, keeping the first frame as the
+    /// stand-in so layout is stable before playback begins.
+    pub fn set_animated_image(&mut self, url: &str, animation: DecodedAnimation) {
+        let Some(image) = self.images.get_mut(url) else {
+            return;
+        };
+        let animated = animation.is_animated();
+        image.animation = animated.then(|| Animation::new(animation.clone()));
+        image.load = ImageLoad::Ready(animation.first);
+        image.prepared = None;
+        image.pending = None;
+    }
+
+    /// the soonest time an on-screen animation will need a redraw.
+    ///
+    /// the event loop only redraws on input, an explicit request, or its
+    /// 1s safety tick, so without this a GIF would sit on its first frame
+    /// until the user happened to press a key. returns None when nothing
+    /// on screen is animating.
+    pub fn next_animation_deadline(&self) -> Option<std::time::Instant> {
+        let now = std::time::Instant::now();
+        self.images
+            .values()
+            .filter_map(|image| image.animation.as_ref())
+            .map(|animation| animation.next_deadline(now))
+            .min()
     }
 
     pub fn link_at(&self, x: u16, y: u16) -> Option<&str> {
@@ -308,6 +430,122 @@ fn pin_generic_font_fallbacks(db: &mut resvg::usvg::fontdb::Database) {
 }
 
 pub fn decode_image(bytes: &[u8]) -> Result<DynamicImage, String> {
+    Ok(decode_image_frames(bytes)?.first)
+}
+
+/// one decoded animation, flattened for rendering.
+///
+/// GIF/WebP frames are sub-rectangles that composite over the previous
+/// frame, so each is painted onto a full-size canvas at its (left, top)
+/// offset. `delays_ms` is per-frame, aligned with `frames`; the last
+/// entry's delay is ignored (nothing follows it).
+#[derive(Clone)]
+pub struct DecodedAnimation {
+    /// first frame, so a still preview exists before playback starts.
+    pub first: DynamicImage,
+    pub frames: Vec<DynamicImage>,
+    pub delays_ms: Vec<u64>,
+}
+
+impl DecodedAnimation {
+    pub fn is_animated(&self) -> bool {
+        self.frames.len() > 1
+    }
+}
+
+// GIFs in mod descriptions are usually short demo loops, but a hostile
+// upload can carry thousands of frames. cap both the frame count and the
+// per-frame pixel budget so a decode can't stall the popup (or the
+// background thread feeding it).
+const MAX_ANIMATION_FRAMES: usize = 120;
+const MAX_ANIMATION_FRAME_BYTES: u64 = 8 * 1024 * 1024;
+// browsers clamp very short frame delays to ~100ms; matching that keeps a
+// 1ms-delay GIF from spinning the redraw loop.
+const MIN_FRAME_DELAY_MS: u64 = 100;
+
+/// decodes still and animated images alike. the animation is a byproduct of
+/// normal decoding (the `gif`/`webp` features are already compiled in), so
+/// this replaces the old single-frame `reader.decode()`: a still image
+/// yields exactly one frame and costs the same as before.
+pub fn decode_image_frames(bytes: &[u8]) -> Result<DecodedAnimation, String> {
+    if let Ok(format) = image::guess_format(bytes)
+        && matches!(format, image::ImageFormat::Gif | image::ImageFormat::WebP)
+    {
+        return decode_animated(bytes, format);
+    }
+
+    let decoded = decode_still_or_svg(bytes)?;
+    Ok(DecodedAnimation {
+        first: decoded.clone(),
+        frames: vec![decoded],
+        delays_ms: vec![MIN_FRAME_DELAY_MS],
+    })
+}
+
+fn decode_animated(bytes: &[u8], format: image::ImageFormat) -> Result<DecodedAnimation, String> {
+    use image::AnimationDecoder;
+    let decoder_frames: image::Frames<'_> = match format {
+        image::ImageFormat::Gif => image::codecs::gif::GifDecoder::new(std::io::Cursor::new(bytes))
+            .map_err(|error| format!("failed to read GIF: {error}"))?
+            .into_frames(),
+        image::ImageFormat::WebP => {
+            image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("failed to read WebP: {error}"))?
+                .into_frames()
+        }
+        _ => return Err("unsupported animation format".to_owned()),
+    };
+
+    let mut frames = Vec::new();
+    let mut delays_ms = Vec::new();
+    let mut canvas_size: Option<(u32, u32)> = None;
+    for frame in decoder_frames {
+        if frames.len() >= MAX_ANIMATION_FRAMES {
+            break;
+        }
+        let frame = frame.map_err(|error| format!("failed to decode animation frame: {error}"))?;
+        let (width, height) = (frame.buffer().width(), frame.buffer().height());
+        if width > MAX_PROJECT_IMAGE_DIMENSION || height > MAX_PROJECT_IMAGE_DIMENSION {
+            return Err("animation frame dimensions are too large".to_owned());
+        }
+        // canvas size comes from the first frame; a GIF that changes size
+        // mid-stream is malformed, so keep the first and pad the rest.
+        let (canvas_width, canvas_height) = *canvas_size.get_or_insert((width, height));
+        let allocation = u64::from(canvas_width)
+            .checked_mul(u64::from(canvas_height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| "animation frame dimensions are too large".to_owned())?;
+        if allocation > MAX_ANIMATION_FRAME_BYTES {
+            return Err("animation frames are too large".to_owned());
+        }
+        let mut canvas = image::RgbaImage::new(canvas_width, canvas_height);
+        // composite the sub-rectangle at its offset; GIF disposal already
+        // happened in the decoder, so a plain copy is correct here.
+        let (left, top) = (frame.left().min(canvas_width), frame.top().min(canvas_height));
+        for (x, y, pixel) in frame.buffer().enumerate_pixels() {
+            if x < canvas_width.saturating_sub(left) && y < canvas_height.saturating_sub(top) {
+                canvas.put_pixel(x + left, y + top, *pixel);
+            }
+        }
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay = numer
+            .checked_div(denom)
+            .map_or(MIN_FRAME_DELAY_MS, |ms| u64::from(ms).max(MIN_FRAME_DELAY_MS));
+        frames.push(DynamicImage::ImageRgba8(canvas));
+        delays_ms.push(delay);
+    }
+
+    let Some(first) = frames.first().cloned() else {
+        return Err("animation contained no frames".to_owned());
+    };
+    Ok(DecodedAnimation {
+        first,
+        frames,
+        delays_ms,
+    })
+}
+
+fn decode_still_or_svg(bytes: &[u8]) -> Result<DynamicImage, String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|error| error.to_string())?;
@@ -1723,6 +1961,31 @@ fn render_image_row(
 // spawns the background preparation for an image at the size it will be
 // drawn at, without touching the viewport — used for off-screen rows so
 // images are ready before they scroll into view.
+// picks the pixels to draw right now: the animation's current frame when
+// this image has one, otherwise the single decoded still. also advances
+// the frame clock and reports whether the frame changed, so the caller can
+// ask for a redraw only when something actually moved.
+// picks the pixels to draw right now: the animation's current frame when
+// this image has one, otherwise the single decoded still. also advances
+// the frame clock and reports whether the frame changed, so the caller can
+// ask for a redraw only when something actually moved.
+//
+// returns a clone because the caller has to write back to the same
+// `DocumentImage` (pending/prepared) right after, and a borrow of the
+// frame would conflict. Cloning is one decoded still-sized buffer, on a
+// path that already clones the image to hand it to the prepare thread.
+fn current_frame(image: &mut DocumentImage) -> Option<(DynamicImage, usize, bool)> {
+    match &mut image.animation {
+        Some(animation) => {
+            let (index, changed) = animation.frame_at(std::time::Instant::now());
+            Some((animation.frames[index].clone(), index, changed))
+        }
+        None => image
+            .load_image()
+            .map(|decoded| (decoded.clone(), 0, false)),
+    }
+}
+
 fn ensure_image_prepared(
     image: &mut DocumentImage,
     reference: &ImageReference,
@@ -1731,14 +1994,15 @@ fn ensure_image_prepared(
     picker: &ratatui_image::picker::Picker,
     pending: &Arc<Mutex<Vec<PreparedImageResult>>>,
 ) {
-    let ImageLoad::Ready(decoded) = &image.load else {
+    if !matches!(&image.load, ImageLoad::Ready(_)) {
         return;
-    };
+    }
     let key = ImageRenderKey {
         width,
         height,
         protocol: picker.protocol_type(),
         mode: crate::config::SETTINGS.ui.image_protocol,
+        frame: image.animation.as_ref().map_or(0, |a| a.frame),
     };
     if image
         .prepared
@@ -1746,6 +2010,7 @@ fn ensure_image_prepared(
         .is_none_or(|(prepared_key, _)| *prepared_key != key)
         && image.pending != Some(key)
     {
+        let (decoded, _, _) = current_frame(image).expect("ready image has pixels");
         image.pending = Some(key);
         prepare_image(
             reference.url.clone(),
@@ -1768,15 +2033,21 @@ fn render_image(
     picker: &ratatui_image::picker::Picker,
     pending: &Arc<Mutex<Vec<PreparedImageResult>>>,
 ) {
-    let ImageLoad::Ready(decoded) = &image.load else {
+    let Some((decoded, frame_index, frame_changed)) = current_frame(image) else {
         render_fallback(frame, area, hidden_top, &reference.alt);
         return;
     };
+    // a frame turn means the next prepared image is stale; drop it so the
+    // re-prepare below actually runs instead of reusing the old encoding.
+    if frame_changed {
+        image.prepared = None;
+    }
     let key = ImageRenderKey {
         width: area.width,
         height: full_height,
         protocol: picker.protocol_type(),
         mode: crate::config::SETTINGS.ui.image_protocol,
+        frame: frame_index,
     };
     if image
         .prepared

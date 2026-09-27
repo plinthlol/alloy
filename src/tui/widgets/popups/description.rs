@@ -200,34 +200,28 @@ fn state_gallery_thumbs(gallery: &[GalleryItem]) -> impl Iterator<Item = String>
 // gallery: modrinth ships screenshots inside the project response (the
 // standalone /gallery routes are write-only, and curseforge's core api has
 // no gallery read at all — its screenshots are embedded in the description
-// HTML, which normalize_html already renders as images). appended to the
-// body as a markdown section so it flows through the same document/image
-// pipeline as everything else, sorted by the author's ordering.
-fn append_gallery(body: String, gallery: &[crate::net::modrinth::GalleryImage]) -> String {
-    if gallery.is_empty() {
-        return body;
-    }
+// HTML, which normalize_html already renders as images).
+//
+// the gallery deliberately does NOT get appended to the body: the author
+// already curates their gallery separately, and splicing `![title](url)`
+// into the markdown made every screenshot show up twice — once in the `g`
+// grid and again as a full image in the description — with each copy
+// fetched and decoded independently. the grid is the only place they live.
+fn gallery_items(gallery: &[crate::net::modrinth::GalleryImage]) -> Vec<GalleryItem> {
     let mut images: Vec<&crate::net::modrinth::GalleryImage> = gallery.iter().collect();
+    // the author's own ordering, not the API's response order.
     images.sort_by_key(|image| image.ordering);
-
-    let mut section = String::from("\n\n## Gallery\n\n");
-    for image in images {
-        let url = image.raw_url.as_deref().unwrap_or(&image.url);
-        if !image.title.is_empty() {
-            section.push_str(&format!("### {}\n\n", image.title));
-        }
-        if !image.description.is_empty() {
-            section.push_str(&image.description);
-            section.push_str("\n\n");
-        }
-        let alt = if image.title.is_empty() {
-            "gallery image"
-        } else {
-            &image.title
-        };
-        section.push_str(&format!("![{alt}]({url})\n\n"));
-    }
-    format!("{body}{section}")
+    images
+        .into_iter()
+        .map(|image| GalleryItem {
+            // url is a ~350px webp thumbnail, raw_url the full-resolution
+            // original; CurseForge-derived entries set both to the same.
+            thumb: image.url.clone(),
+            raw: image.raw_url.clone().unwrap_or_else(|| image.url.clone()),
+            title: image.title.clone(),
+            featured: image.featured,
+        })
+        .collect()
 }
 
 // fetch hardening: Document::new runs in a spawned task, where a panic
@@ -262,21 +256,7 @@ async fn fetch(request_id: u64, key: String, source: DescriptionSource, fallback
                 DescriptionSource::Modrinth { project_id } => {
                     crate::net::modrinth::get_project(&client, project_id)
                         .await
-                        .map(|p| {
-                            let gallery = p
-                                .gallery
-                                .iter()
-                                .map(|g| GalleryItem {
-                                    // url is a ~350px webp thumbnail, raw_url
-                                    // the full-resolution original
-                                    thumb: g.url.clone(),
-                                    raw: g.raw_url.clone().unwrap_or_else(|| g.url.clone()),
-                                    title: g.title.clone(),
-                                    featured: g.featured,
-                                })
-                                .collect();
-                            (p.title, append_gallery(p.body, &p.gallery), gallery)
-                        })
+                        .map(|p| (p.title, p.body, gallery_items(&p.gallery)))
                         .map_err(|e| e.to_string())
                 }
                 DescriptionSource::CurseForge { mod_id } => {
@@ -395,16 +375,29 @@ async fn fetch(request_id: u64, key: String, source: DescriptionSource, fallback
         let client = client.clone();
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
+            // an imgur page/album url isn't fetchable as-is — rewrite it
+            // to the image host so the bytes come back as an image.
+            let fetch_url = crate::net::imgur::resolve_image_url(&url);
             let result = async {
                 let _permit = semaphore
                     .acquire_owned()
                     .await
                     .map_err(|e| e.to_string())?;
                 let bytes = client
-                    .get_bytes_limited(&url, MAX_PROVIDER_ASSET_BYTES)
+                    .get_bytes_limited(&fetch_url, MAX_PROVIDER_ASSET_BYTES)
                     .await
                     .map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || markdown::decode_image(&bytes))
+                // imgur answers a deleted/blocked image with a 200 that
+                // redirects to a small "removed" PNG. it decodes fine, so
+                // check the payload and report a failure instead of
+                // rendering the wrong picture.
+                if crate::net::imgur::is_placeholder_bytes(&bytes) {
+                    return Err("image is no longer available on imgur".to_owned());
+                }
+                // decodes stills and multi-frame GIF/WebP alike; the
+                // animation's frames are only built when there are more
+                // than one, so this stays cheap for the common case.
+                tokio::task::spawn_blocking(move || markdown::decode_image_frames(&bytes))
                     .await
                     .map_err(|e| e.to_string())?
             }
@@ -414,16 +407,27 @@ async fn fetch(request_id: u64, key: String, source: DescriptionSource, fallback
     }
     while let Some(task) = tasks.join_next().await {
         let Ok((url, result)) = task else { continue };
-        if let Ok(image) = &result {
+        if let Ok(animation) = &result {
             let mut cache = lock_images();
             if cache.len() >= MAX_IMAGE_CACHE_ENTRIES {
                 cache.clear();
             }
-            cache.insert((key.clone(), url.clone()), image.clone());
+            // the cache holds the still (grid thumbnails and the gallery
+            // preview build from it); frames live in the Document, which is
+            // discarded when the popup closes.
+            cache.insert((key.clone(), url.clone()), animation.first.clone());
         }
         apply(request_id, &key, |state| {
             if let Some(document) = state.document.as_mut() {
-                document.set_image(&url, result.clone());
+                match result.clone() {
+                    Ok(animation) => document.set_animated_image(&url, animation),
+                    // decode failures are indistinguishable from fetch
+                    // failures here, and both just show the fallback icon
+                    Err(error) => {
+                        tracing::debug!("Failed to decode project image {url}: {error}");
+                        document.set_image(&url, Err(error));
+                    }
+                }
             }
         });
         request_redraw();
@@ -648,14 +652,29 @@ pub fn render_content(frame: &mut Frame, inner: Rect, picker: &ratatui_image::pi
     // returns it — read scroll before taking the document borrow, write back
     // after it ends.
     let mut scroll = state.scroll;
-    let height = if let Some(document) = state.document.as_mut() {
-        markdown::render(frame, inner, document, &mut scroll, picker)
+    let (height, animation_deadline) = if let Some(document) = state.document.as_mut() {
+        let height = markdown::render(frame, inner, document, &mut scroll, picker);
+        (height, document.next_animation_deadline())
     } else {
         return;
     };
     state.scroll = scroll;
     state.max_scroll = height;
+    // an animated GIF/WebP on screen needs a redraw when its next frame is
+    // due; without this it would sit on frame 0 until the user pressed a
+    // key. request a redraw instead of sleeping, so the render pass stays
+    // non-blocking — the event loop's poll cadence paces playback.
+    if animation_deadline
+        .is_some_and(|deadline| deadline <= std::time::Instant::now() + FRAME_EAGER_WINDOW)
+    {
+        request_redraw();
+    }
 }
+
+// an on-screen animation is asked to redraw slightly before its frame is
+// actually due, so the next tick is already drawing the new frame rather
+// than a tick late. comfortably larger than the event loop's 16ms poll.
+const FRAME_EAGER_WINDOW: std::time::Duration = std::time::Duration::from_millis(40);
 
 // grid cell sizing, mirroring screenshots_grid's constraints.
 const TARGET_CELL_WIDTH: u16 = 34;
