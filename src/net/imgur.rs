@@ -17,14 +17,22 @@
 // the single-image page form: imgur serves it as a redirect to the CDN.
 //
 // NOTE: imgur answers image-host requests for deleted/blocked images with
-// a 200 that redirects to `i.imgur.com/removed.png`. that is a valid PNG
-// and would decode happily into a wrong picture, so the fetch path checks
-// `is_placeholder_bytes` on the response and reports a failure instead.
+// a 200 that redirects to its "removed" asset. that is a valid PNG and
+// would decode happily into a wrong picture, so the fetch path checks
+// `is_placeholder` against the response's final url and reports a failure
+// instead. the asset itself is committed alongside this module so the
+// check is made against the bytes imgur really serves, not a guess.
+//
+// the rewrite for the page form is verified end to end: imgur redirects
+// `imgur.com/<id>.<ext>` to `i.imgur.com/<id>.<ext>`, which is exactly
+// the url this module builds.
 
 const IMGUR_PAGE_HOST: &str = "imgur.com";
 const IMGUR_IMAGE_HOST: &str = "i.imgur.com";
-// the 1x1 (or 0x0) "image removed" placeholder imgur redirects to.
-const REMOVED_IMAGE: &[u8] = b"removed.png";
+
+// imgur's "this image is gone" asset. the cdn serves this file name in
+// place of any image it will not hand out.
+const REMOVED_IMAGE: &str = "removed.png";
 
 /// rewrites an imgur page url into a directly fetchable image url, when
 /// the url is one this module knows how to handle. anything else — other
@@ -65,8 +73,15 @@ fn split_url(url: &str) -> Option<UrlParts> {
         .split_once(':')
         .map_or(authority, |(host, _)| host)
         .to_ascii_lowercase();
+    // `?` and `#` start the query and fragment, which are not path
+    // segments. cut them off before splitting so `a.png?v=1` is one
+    // segment. `#` goes first so a fragment cannot hide a query.
+    let without_fragment = path.split_once('#').map_or(path, |(before, _)| before);
+    let path = without_fragment
+        .split_once('?')
+        .map_or(without_fragment, |(before, _)| before);
     let path_segments = path
-        .split(['/', '?', '#'])
+        .split('/')
         .filter(|segment| !segment.is_empty())
         .map(str::to_owned)
         .collect();
@@ -92,16 +107,60 @@ fn split_extension(segment: &str) -> (&str, Option<&str>) {
         .map_or((segment, None), |(id, ext)| (id, Some(ext)))
 }
 
-/// whether a decoded response is imgur's "this image is gone" placeholder
-/// rather than the picture the author linked.
+/// whether a fetch of an imgur image actually got the author's picture.
 ///
-/// the placeholder is served with a 200 and a real content-type, so the
-/// only reliable tell is the payload itself: a PNG that is a few hundred
-/// bytes and is byte-identical to the well-known removed.png. comparing
-/// the tail is enough — the file is small and has no trailing data.
-pub fn is_placeholder_bytes(bytes: &[u8]) -> bool {
-    bytes.len() <= 4096 && bytes.ends_with(REMOVED_IMAGE)
+/// imgur answers a deleted or blocked image with a 200 that redirects to
+/// its "removed" asset. two independent tells are checked:
+///
+/// - the response landed on that asset, which is what the redirect looks
+///   like to the http client;
+/// - the body is that asset's exact bytes, which catches a serve that
+///   redirects without a location header (a 200 rewrite on the edge), and
+///   only for imgur — `resolve_image_url` reports whether the url was
+///   actually an imgur one.
+///
+/// returns whether this is a placeholder. a non-imgur url is never a
+/// placeholder, whatever it redirects to.
+pub fn is_placeholder(final_url: &str, bytes: &[u8]) -> bool {
+    is_placeholder_on(final_url, bytes, IMGUR_IMAGE_HOST)
 }
+
+/// [`is_placeholder`], with the image host as a parameter so the check can
+/// be exercised against a stand-in host.
+pub fn is_placeholder_on(final_url: &str, bytes: &[u8], image_host: &str) -> bool {
+    if !is_asset_at(final_url, image_host, REMOVED_IMAGE) {
+        return false;
+    }
+    // the real file is 503 bytes. the cap keeps a genuine (if tiny) gif
+    // from being misread as one, and bounds the hash to a fixed cost.
+    bytes.len() == 503 && md5_of(bytes) == REMOVED_IMAGE_MD5
+}
+
+fn md5_of(bytes: &[u8]) -> [u8; 16] {
+    use md5::{Digest, Md5};
+
+    let mut hasher = Md5::new();
+    hasher.update(bytes);
+    hasher.finalize().into()
+}
+
+/// whether `url` is `asset` served from `host`, host-matched
+/// case-insensitively with any query and fragment ignored.
+fn is_asset_at(url: &str, host: &str, asset: &str) -> bool {
+    let Some(parts) = split_url(url) else {
+        return false;
+    };
+    parts.host == host.to_ascii_lowercase()
+        && parts.path_segments.as_slice() == [asset.to_ascii_lowercase()]
+}
+
+/// md5 of the asset imgur actually served for a missing image, captured
+/// from a live `i.imgur.com` response. matching the digest rather than the
+/// contents keeps the constant small and ignores nothing that matters —
+/// the same file always decodes to the same bytes.
+const REMOVED_IMAGE_MD5: [u8; 16] = [
+    0xd8, 0x35, 0x88, 0x43, 0x73, 0xf4, 0xd6, 0xc8, 0xf2, 0x47, 0x42, 0xce, 0xab, 0xe7, 0x49, 0x46,
+];
 
 #[cfg(test)]
 mod tests {
@@ -174,23 +233,68 @@ mod tests {
 
     #[test]
     fn a_placeholder_response_is_recognized() {
-        // the real removed.png is a 503-byte PNG; the tail is the part
-        // that distinguishes it from a normal image.
-        let mut placeholder = b"\x89PNG\r\n\x1a\n".to_vec();
-        placeholder.extend_from_slice(&[0u8; 400]);
-        placeholder.extend_from_slice(b"IEND\xaeB`\x82removed.png");
-        assert!(is_placeholder_bytes(&placeholder));
+        // the real bytes imgur serves in place of a missing image: a
+        // 503-byte png. its tail is the png iend chunk, and it carries no
+        // text chunks at all, so it is matched by digest.
+        let placeholder = real_removed_png();
+        assert!(
+            is_placeholder("https://i.imgur.com/removed.png", &placeholder),
+            "the real payload, served from the real url, is a placeholder"
+        );
     }
 
     #[test]
     fn a_normal_image_is_not_a_placeholder() {
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.extend_from_slice(&[0u8; 4000]);
-        assert!(!is_placeholder_bytes(&png));
-        // a same-sized file that merely mentions the placeholder path
-        let mut mentions = b"\x89PNG\r\n\x1a\n".to_vec();
-        mentions.extend_from_slice(&[0u8; 400]);
-        mentions.extend_from_slice(b"IEND\xaeB`\x82real.png");
-        assert!(!is_placeholder_bytes(&mentions));
+        // a real gif on the imgur host is an author's picture
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend_from_slice(&[0u8; 503 - 6]);
+        assert!(!is_placeholder("https://i.imgur.com/3Z3SjtK.gif", &gif));
+        // the real placeholder bytes, but on a url that is not the asset
+        assert!(!is_placeholder(
+            "https://i.imgur.com/3Z3SjtK.png",
+            &real_removed_png()
+        ));
+        // the placeholder url, but different bytes
+        assert!(!is_placeholder(
+            "https://i.imgur.com/removed.png",
+            b"GIF89a this is a different image entirely"
+        ));
+    }
+
+    #[test]
+    fn only_imgur_urls_can_be_placeholders() {
+        // a non-imgur host redirecting to a same-named file is fine
+        assert!(!is_placeholder(
+            "https://example.com/removed.png",
+            &real_removed_png()
+        ));
+        // ... and a non-imgur host's own bytes are never a placeholder
+        assert!(!is_placeholder("https://example.com/photo.png", b""));
+    }
+
+    #[test]
+    fn placeholder_urls_are_matched_case_insensitively_and_ignore_the_query() {
+        let placeholder = real_removed_png();
+        for url in [
+            "https://i.imgur.com/removed.png",
+            "https://I.Imgur.com/removed.png",
+            "https://i.imgur.com/removed.png?v=1",
+            "https://i.imgur.com/removed.png#frag",
+        ] {
+            assert!(is_placeholder(url, &placeholder), "{url}");
+        }
+        // a path that merely starts with the asset name is not the asset
+        assert!(!is_placeholder(
+            "https://i.imgur.com/removed.png/other",
+            &placeholder
+        ));
+    }
+
+    /// the exact 503-byte png imgur serves for a deleted or blocked image.
+    fn real_removed_png() -> Vec<u8> {
+        const PAYLOAD: &[u8] = include_bytes!("imgur_removed.png");
+        assert_eq!(PAYLOAD.len(), 503, "the captured asset's size");
+        assert_eq!(md5_of(PAYLOAD), REMOVED_IMAGE_MD5);
+        PAYLOAD.to_vec()
     }
 }

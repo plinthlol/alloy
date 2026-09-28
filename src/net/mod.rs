@@ -194,6 +194,39 @@ impl HttpClient {
         .await
     }
 
+    // like get_bytes_limited, but also reports the url the response finally
+    // came from. imgur answers a deleted or blocked image with a 200 that
+    // redirects to its "removed" placeholder, so the caller needs to see
+    // where it landed, not just the bytes.
+    pub async fn get_bytes_limited_at(
+        &self,
+        url: &str,
+        limit: usize,
+    ) -> Result<(Vec<u8>, String), NetError> {
+        get_with_retry(self, url, move |mut response| async move {
+            let final_url = response.url().to_string();
+            if response
+                .content_length()
+                .is_some_and(|length| length > limit as u64)
+            {
+                return Err(NetError::Parse(format!(
+                    "Response exceeds the {limit}-byte limit"
+                )));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await? {
+                if bytes.len().saturating_add(chunk.len()) > limit {
+                    return Err(NetError::Parse(format!(
+                        "Response exceeds the {limit}-byte limit"
+                    )));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok((bytes, final_url))
+        })
+        .await
+    }
+
     pub async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, NetError> {
         let url_owned = url.to_string();
         get_with_retry(self, url, move |resp| {

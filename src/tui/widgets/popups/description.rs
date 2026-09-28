@@ -383,15 +383,15 @@ async fn fetch(request_id: u64, key: String, source: DescriptionSource, fallback
                     .acquire_owned()
                     .await
                     .map_err(|e| e.to_string())?;
-                let bytes = client
-                    .get_bytes_limited(&fetch_url, MAX_PROVIDER_ASSET_BYTES)
+                let (bytes, final_url) = client
+                    .get_bytes_limited_at(&fetch_url, MAX_PROVIDER_ASSET_BYTES)
                     .await
                     .map_err(|e| e.to_string())?;
                 // imgur answers a deleted/blocked image with a 200 that
-                // redirects to a small "removed" PNG. it decodes fine, so
+                // redirects to its "removed" asset. it decodes fine, so
                 // check the payload and report a failure instead of
                 // rendering the wrong picture.
-                if crate::net::imgur::is_placeholder_bytes(&bytes) {
+                if crate::net::imgur::is_placeholder(&final_url, &bytes) {
                     return Err("image is no longer available on imgur".to_owned());
                 }
                 // decodes stills and multi-frame GIF/WebP alike; the
