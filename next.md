@@ -23,11 +23,17 @@ cover both GIF and Imgur.
 |---|---|
 | 4 — `## Gallery` removed from the description body | Done, verified in the TUI |
 | 2 — GIF playback | Done, unit-tested, not yet seen animating on screen |
-| 3 — Imgur | Implemented, but cannot be validated from this machine (see below) |
+| 3 — Imgur | Resolver verified end to end; **placeholder guard was broken and is now fixed** |
 | 1 — images need scrolling | **Not reproduced.** No fix shipped; two hypotheses disproven |
 
-Test suite: 471 passed, 0 failed, 12 ignored. Clippy: 0 errors, 20
-warnings, identical to clean `HEAD` (all pre-existing).
+Test suite: 476 passed, 0 failed, 12 ignored. Clippy: 0 errors, 29
+warnings, identical to `HEAD` (all pre-existing).
+
+Building and testing needs a JDK on `PATH` for `build.rs`, and
+`NO_COLOR` must be unset — with `NO_COLOR=1` in the environment,
+`config::theme::tests::resolve_builtin_theme` fails because the theme
+resolves to `no-color`. That is an environment interaction, not a
+regression.
 
 ## What changed
 
@@ -108,43 +114,97 @@ Image IDs are validated as 5 or 7 alphanumeric characters, host matching is
 case-insensitive, and userinfo/port/query/fragment are stripped before
 matching.
 
-A second guard, `is_placeholder_bytes()`, runs on every fetched response.
-Imgur answers a deleted or blocked image with **HTTP 200** that redirects to
-`i.imgur.com/removed.png` — a valid 503-byte PNG that `decode_still_or_svg`
-decodes happily. Without this check a removed image would render as a wrong
-picture; with it, the URL reports a failure and the normal fallback icon
-shows.
+A second guard runs on every fetched response. Imgur answers a deleted or
+blocked image with **HTTP 200** that redirects to its "removed" asset — a
+valid 503-byte PNG that `decode_still_or_svg` decodes happily. Without
+this check a removed image renders as a wrong picture; with it, the URL
+reports a failure and the normal fallback icon shows.
 
-9 unit tests cover the resolver and the placeholder check.
+**The first version of this guard was broken — see the section below.**
 
-## Open: Imgur cannot be validated here
+11 unit tests cover the resolver and the placeholder check, and
+`tests/net_imgur.rs` (new) covers the fetch path end to end.
 
-A live probe from this machine, using alloy's exact user agent
-(`alloy/3.80.0 (Minecraft Launcher)`) and reqwest defaults:
+## Imgur: the placeholder guard never worked, and the rewrite is confirmed
 
-| URL | status | final URL | bytes |
-|---|---|---|---|
-| `i.imgur.com/wTn2Bbf.png` | 200 | `i.imgur.com/removed.png` | 503 |
-| `i.imgur.com/3Z3SjtK.gif` | 200 | `i.imgur.com/removed.png` | 503 |
-| `imgur.com/wTn2Bbf.png` | 200 | `i.imgur.com/removed.png` | 503 |
-| `imgur.com/gallery/abc123` | 200 | unchanged | 5478 (HTML) |
+The earlier note said Imgur "cannot be validated from this machine". The
+placeholder behaviour *can* be validated — this environment's network path
+reaches imgur just fine, it simply has no image to serve. The ids used in
+the first probe turn out to be deleted, so imgur answers with its
+"removed" asset, which is exactly the case the guard exists for.
 
-A Chrome user agent gets the identical placeholder, and album HTML carries
-no `og:image` to scrape. So this environment serves every Imgur request a
-"removed" picture regardless of headers.
+### The guard was broken
 
-Consequences:
+The old check was:
 
-- The resolver's rewrite is verified by unit tests only. It needs one manual
-  check from a network that serves real Imgur bytes.
-- The placeholder guard is the reason the feature is safe to ship at all.
-  Without it, the 503-byte PNG would decode and display as if it were the
-  author's picture.
-- Album URLs genuinely have no single image, so they stay unsupported. If
-  one of those needs to work it requires the Imgur API (client ID), which
+```rust
+bytes.len() <= 4096 && bytes.ends_with(b"removed.png")
+```
+
+The tail comment claimed `removed.png` is "byte-identical to the
+well-known removed.png" and that the file "ends with" that name. It does
+not. The real asset's last 16 bytes are:
+
+```
+327 u " 262 \0 \0 \0 \0 I E N D 256 B ` 202
+```
+
+The string `removed.png` appears **nowhere** in the file — no `tEXt` or
+`iTXt` chunk, nothing in the raw bytes. `ends_with` is therefore always
+false for the real payload, so every deleted or blocked imgur image
+rendered as a picture of imgur's placeholder instead of falling back to
+the error icon. The feature's one safety net was inert.
+
+The guard's unit test passed because it built its own fixture ending in
+the literal `removed.png` — the fixture asserted the bug rather than
+catching it. Confirmed by running the old check against the real payload:
+
+```
+real payload,  old guard fires: false
+hand-built fixture the old test used, old guard fires: true
+```
+
+### What the fix does
+
+`is_placeholder_bytes` is replaced by `is_placeholder(final_url, bytes)`,
+which checks two independent tells:
+
+- the response landed on `i.imgur.com/removed.png` (the redirect's shape,
+  via a new `HttpClient::get_bytes_limited_at` that returns the final URL);
+- the body is the asset's exact bytes, matched by MD5 against the
+  committed `src/net/imgur_removed.png` (503 bytes, captured from the live
+  response), and only for an imgur host.
+
+`is_placeholder_on` takes the host as a parameter so the payload arm is
+testable against a stand-in host.
+
+While adding the query/fragment cases the test exposed a latent bug in
+`split_url`: chaining `.map_or(path, …)` shadowed `path`, so the fragment
+was cut from the un-trimmed string and `removed.png?v=1` never matched.
+`#` is now cut first, into a named binding. This also makes
+`resolve_image_url` correct for ids carrying a query string, which it
+silently mangled before.
+
+`tests/net_imgur.rs` (new, 3 tests) drives the real `HttpClient` against
+wiremock serving the committed asset, covering the redirect case, the
+direct-serve case, and a real GIF that must *not* be flagged.
+
+### The rewrite is confirmed
+
+`https://imgur.com/3Z3SjtK.gif` 302-redirects to
+`https://i.imgur.com/3Z3SjtK.gif` — byte-for-byte the URL
+`resolve_image_url` builds. The page→CDN rewrite is verified end to end,
+not just by unit test.
+
+### Still open
+
+- Album URLs (`imgur.com/a/…`, `/gallery/…`) have no single image, so they
+  stay unsupported. Supporting one needs the Imgur API (client ID), which
   means a new config field.
-- No real Imgur URLs appeared in the first 20 Modrinth search hits, so there
-  is no convenient end-to-end fixture yet.
+- No live Imgur id that still resolves was found, so the happy path
+  (a real image rendering in the TUI) has not been seen on screen. One
+  manual check from a network serving live imgur bytes would close this.
+- The GIF work still has not been watched animating; see below.
 
 ## Open: the scroll bug was not reproduced
 
@@ -203,5 +263,10 @@ Three regression tests that should be re-run once it reproduces are in
   text renders invisibly — a real environment dependency, not a test
   artifact.
 - Building requires a JDK on `PATH` (`build.rs` compiles
-  `java/AlloyShim.java`); this machine needed `jdk21-openjdk` and
-  `export PATH="/usr/lib/jvm/java-21-openjdk/bin:$PATH"`.
+  `java/AlloyShim.java`). A Temurin 21 tarball with no package manager
+  available: `curl -sSL "https://api.adoptium.net/v3/binary/latest/21/ga/linux/x64/jdk/hotspot/normal/eclipse"`
+  then untar and put its `bin` on `PATH`.
+- `src/net/imgur_removed.png` is a captured third-party asset (imgur's
+  "removed" placeholder), committed only so the guard matches real bytes.
+  It is not an alloy asset and is not covered by the `assets/` icon
+  pipeline.
