@@ -156,6 +156,21 @@ pub fn get(name: &str) -> Option<RunState> {
     RUNNING.lock().ok().and_then(|map| map.get(name).cloned())
 }
 
+/// true while the named instance has a live session: authenticating,
+/// starting, running, or orphaned. this is exactly the set of states for
+/// which the Esc kill popup is reachable — mid-auth Enter cancels the
+/// pending launch, the rest signal the child (or orphaned pid).
+#[must_use]
+pub fn is_alive(name: &str) -> bool {
+    matches!(
+        get(name),
+        Some(RunState::Authenticating)
+            | Some(RunState::Starting)
+            | Some(RunState::Running)
+            | Some(RunState::Orphaned(_))
+    )
+}
+
 #[must_use]
 pub fn has_active() -> bool {
     RUNNING.lock().is_ok_and(|map| {
@@ -283,6 +298,29 @@ pub fn rename_tracked(old_name: &str, new_name: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_alive_true_for_live_states() {
+        for (suffix, state) in [
+            ("auth", RunState::Authenticating),
+            ("starting", RunState::Starting),
+            ("running", RunState::Running),
+            ("orphan", RunState::Orphaned(u32::MAX - 3)),
+        ] {
+            let name = format!("run_test_alive_{suffix}");
+            set_state(&name, state);
+            assert!(is_alive(&name), "{suffix} should count as alive");
+            remove(&name);
+        }
+    }
+
+    #[test]
+    fn is_alive_false_for_idle_states() {
+        assert!(!is_alive("run_never_set_alive_xyz"));
+        set_state("run_test_alive_crash", RunState::Crashed(Some(1)));
+        assert!(!is_alive("run_test_alive_crash"));
+        remove("run_test_alive_crash");
+    }
 
     #[test]
     fn set_and_get_state() {

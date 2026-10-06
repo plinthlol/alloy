@@ -69,6 +69,44 @@ impl App {
         }
 
         if self.focused == FocusedArea::ConfirmDelete {
+            // kill confirmation: Enter kills the running instance, b/Esc
+            // backs out. handled before the delete targets below so 'b'
+            // stays a kill-popup-only binding.
+            if let Some(confirm_popup::ConfirmTarget::Kill { name, origin }) =
+                confirm_popup::pending_target()
+            {
+                match key_event.code {
+                    KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if matches!(
+                            crate::running::get(&name),
+                            Some(crate::running::RunState::Authenticating)
+                        ) {
+                            // no kill sender exists until after auth, so
+                            // cancelling means dropping the marker (the
+                            // pending launch task bails at its checkpoint).
+                            // send first anyway in case it raced past
+                            // registration — a no-op if nobody's listening.
+                            crate::running::send_kill(&name);
+                            crate::running::remove(&name);
+                        } else {
+                            crate::running::send_kill(&name);
+                        }
+                        confirm_popup::clear_pending();
+                        self.focused = origin;
+                    }
+                    KeyCode::Esc
+                    | KeyCode::Backspace
+                    | KeyCode::Char('b')
+                    | KeyCode::Char('B')
+                    | KeyCode::Char('n')
+                    | KeyCode::Char('N') => {
+                        confirm_popup::clear_pending();
+                        self.focused = origin;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
             match key_event.code {
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                     let focus_after = match confirm_popup::pending_target() {
@@ -108,6 +146,10 @@ impl App {
                             FocusedArea::Content
                         }
                         None => FocusedArea::Instances,
+                        // unreachable: Kill targets are handled (and the
+                        // popup cleared) by the branch above. restore the
+                        // origin if one ever slips through anyway.
+                        Some(confirm_popup::ConfirmTarget::Kill { origin, .. }) => origin,
                     };
                     confirm_popup::clear_pending();
                     self.focused = focus_after;
@@ -535,15 +577,21 @@ impl App {
                             self.instances_state.renaming = Some(inst.name.clone());
                         }
                     }
-                    // esc = kill running instance. brutal but effective
+                    // esc asks to kill the selected instance — but only
+                    // while it's actually running (mid-auth counts: Enter
+                    // cancels the pending launch). idle instances show the
+                    // launch hint instead, and Esc stays a no-op for them.
                     KeyCode::Esc
                         if matches!(
                             self.focused,
                             FocusedArea::Instances | FocusedArea::Content
                         ) && !self.instances_state.search.active =>
                     {
-                        if let Some(instance) = self.instances_state.selected_instance() {
-                            crate::running::send_kill(&instance.name);
+                        if let Some(instance) = self.instances_state.selected_instance().cloned()
+                            && crate::running::is_alive(&instance.name)
+                        {
+                            confirm_popup::set_pending_kill(&instance.name, self.focused);
+                            self.focused = FocusedArea::ConfirmDelete;
                         }
                     }
                     _ => {}

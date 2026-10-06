@@ -482,6 +482,17 @@ pub async fn launch(
         invocation.main_class
     );
     let (kill_tx, kill_rx) = tokio::sync::oneshot::channel::<()>();
+    // the user may have cancelled (Esc kill popup) while auth was
+    // resolving, which clears the Authenticating marker. bail quietly
+    // instead of spawning — otherwise the launch would continue and
+    // resurrect run state the UI already dropped.
+    if !matches!(
+        crate::running::get(&name),
+        Some(crate::running::RunState::Authenticating)
+    ) {
+        tracing::info!("[{}] Launch cancelled before spawn; not starting", name);
+        return Ok(());
+    }
     crate::running::register_kill(&name, kill_tx);
     crate::running::set_state(&name, crate::running::RunState::Starting);
     tracing::info!(

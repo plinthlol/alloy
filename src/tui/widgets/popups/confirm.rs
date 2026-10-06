@@ -16,6 +16,7 @@ use ratatui::{
 };
 
 use crate::config::theme::THEME;
+use crate::tui::app::FocusedArea;
 
 static CONFIRM_STATE: LazyLock<Mutex<ConfirmState>> =
     LazyLock::new(|| Mutex::new(ConfirmState::default()));
@@ -38,11 +39,21 @@ pub enum ConfirmTarget {
         name: String,
         path: std::path::PathBuf,
     },
+    /// stop a running instance. `origin` is the focus area to restore on
+    /// confirm or cancel — the Esc kill binding fires from Instances or
+    /// Content, and the popup must hand focus back to where it came from.
+    Kill {
+        name: String,
+        origin: FocusedArea,
+    },
 }
 
 impl ConfirmTarget {
     fn title(&self) -> String {
-        format!(" Delete '{}' ", self.name())
+        match self {
+            ConfirmTarget::Kill { name, .. } => format!(" Kill '{name}' "),
+            _ => format!(" Delete '{}' ", self.name()),
+        }
     }
 
     fn body(&self) -> &'static str {
@@ -50,6 +61,7 @@ impl ConfirmTarget {
             ConfirmTarget::Instance { .. } => "This will permanently remove the instance",
             ConfirmTarget::Account { .. } => "This will permanently remove this account",
             ConfirmTarget::Content { .. } => "This will permanently remove the selected item",
+            ConfirmTarget::Kill { .. } => "This will stop the running game",
         }
     }
 
@@ -58,6 +70,7 @@ impl ConfirmTarget {
             ConfirmTarget::Instance { name } => name,
             ConfirmTarget::Account { username, .. } => username,
             ConfirmTarget::Content { name, .. } => name,
+            ConfirmTarget::Kill { name, .. } => name,
         }
     }
 }
@@ -88,6 +101,13 @@ pub fn set_pending_content_delete(name: impl Into<String>, path: impl Into<std::
     });
 }
 
+pub fn set_pending_kill(name: impl Into<String>, origin: FocusedArea) {
+    set_pending(ConfirmTarget::Kill {
+        name: name.into(),
+        origin,
+    });
+}
+
 pub fn pending_target() -> Option<ConfirmTarget> {
     match CONFIRM_STATE.lock() {
         Ok(s) => s.target.clone(),
@@ -109,18 +129,31 @@ pub fn clear_pending() {
 pub struct ConfirmPopup {
     title: String,
     body: &'static str,
+    keybinds: &'static [(&'static str, &'static str)],
 }
 
 impl ConfirmPopup {
-    pub fn new(title: impl Into<String>, body: &'static str) -> Self {
+    pub fn new(
+        title: impl Into<String>,
+        body: &'static str,
+        keybinds: &'static [(&'static str, &'static str)],
+    ) -> Self {
         Self {
             title: title.into(),
             body,
+            keybinds,
         }
     }
 
     pub fn for_target(target: &ConfirmTarget) -> Self {
-        Self::new(target.title(), target.body())
+        match target {
+            // ⏎ kills, b/Esc backs out — the whole point of the popup is
+            // a cheap, discoverable confirmation, not a quiz.
+            ConfirmTarget::Kill { .. } => {
+                Self::new(target.title(), target.body(), &[("Enter", " kill"), ("b/Esc", " back")])
+            }
+            _ => Self::new(target.title(), target.body(), &[("Enter", " confirm")]),
+        }
     }
 }
 
@@ -135,7 +168,7 @@ impl Widget for ConfirmPopup {
                 .fg(theme.text_dim())
                 .add_modifier(Modifier::BOLD),
         )]);
-        let kb = keybind_line(&[("Enter", " confirm")]);
+        let kb = keybind_line(self.keybinds);
 
         let border_color = theme.text_dim();
         let bg_color = theme.surface();

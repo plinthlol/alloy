@@ -148,13 +148,25 @@ pub fn render(
         block = block.title_top(sl);
     }
 
+    // the launch/kill first slot swaps with the selected instance's run
+    // state: while it's running Esc kills it and ctrl+⏎ is a no-op;
+    // while idle ctrl+⏎ launches and Esc does nothing. only the live
+    // one is shown — advertising both was wrong half the time.
+    let is_running = instance.is_some_and(|i| crate::running::is_alive(&i.name));
+    let run_bind = || -> (&'static str, &'static str) {
+        if is_running {
+            ("Esc", " kill")
+        } else {
+            (launch_key(), " launch")
+        }
+    };
+
     // keybinds change depending on which tab is active and whether
     // the content panel or instances panel has focus
-    let kb: Option<&[(&str, &str)]> = if is_focused {
+    let kb: Option<Vec<(&str, &str)>> = if is_focused {
         Some(match tab {
-            ContentTab::Mods | ContentTab::ResourcePacks => &[
-                (launch_key(), " launch"),
-                ("Esc", " kill"),
+            ContentTab::Mods | ContentTab::ResourcePacks => vec![
+                run_bind(),
                 (open_dir_key(), " open dir"),
                 ("j/k", " navigate"),
                 ("⏎", " toggle"),
@@ -163,18 +175,16 @@ pub fn render(
                 ("h/l", " tabs"),
                 ("/", " search"),
             ],
-            ContentTab::Worlds => &[
-                (launch_key(), " launch"),
-                ("Esc", " kill"),
+            ContentTab::Worlds => vec![
+                run_bind(),
                 (open_dir_key(), " open dir"),
                 ("j/k", " navigate"),
                 ("d", " delete"),
                 ("h/l", " tabs"),
                 ("/", " search"),
             ],
-            ContentTab::Screenshots => &[
-                (launch_key(), " launch"),
-                ("Esc", " kill"),
+            ContentTab::Screenshots => vec![
+                run_bind(),
                 (open_dir_key(), " open dir"),
                 ("shift+HJKL", " grid"),
                 ("⏎", " open"),
@@ -185,19 +195,26 @@ pub fn render(
             ContentTab::Logs => {
                 if content.logs.viewer_focused {
                     if content.logs.display_count() == 0 {
-                        // nothing to scroll or search when the pane is empty,
-                        // so surface the one thing that's actually useful here:
-                        // launching the instance (or killing it, if it somehow
-                        // started between renders).
-                        &[
-                            (launch_key(), " launch"),
-                            ("Esc", " kill"),
+                        // empty pane: Esc isn't consumed by the viewer, it
+                        // falls through to the global kill binding — match
+                        // the run-state bind like everywhere else.
+                        vec![run_bind(), (open_dir_key(), " open dir")]
+                    } else if is_running {
+                        // reading a log while running: Esc goes "back" out
+                        // of the viewer and never reaches the global kill
+                        // binding, so there is no kill slot to advertise.
+                        vec![
                             (open_dir_key(), " open dir"),
+                            ("j/k", " scroll"),
+                            ("g/G", " top/bottom"),
+                            ("d", " delete"),
+                            ("ctrl+c", " copy"),
+                            ("Esc", " back"),
+                            ("/", " search"),
                         ]
                     } else {
-                        &[
+                        vec![
                             (launch_key(), " launch"),
-                            ("Esc", " kill"),
                             (open_dir_key(), " open dir"),
                             ("j/k", " scroll"),
                             ("g/G", " top/bottom"),
@@ -208,9 +225,8 @@ pub fn render(
                         ]
                     }
                 } else {
-                    &[
-                        (launch_key(), " launch"),
-                        ("Esc", " kill"),
+                    vec![
+                        run_bind(),
                         (open_dir_key(), " open dir"),
                         ("j/k", " navigate"),
                         ("⏎", " view"),
@@ -223,11 +239,10 @@ pub fn render(
             }
             ContentTab::Settings => {
                 if content.settings.is_editing() {
-                    &[("⏎", " confirm"), ("Esc", " cancel")]
+                    vec![("⏎", " confirm"), ("Esc", " cancel")]
                 } else {
-                    &[
-                        (launch_key(), " launch"),
-                        ("Esc", " kill"),
+                    vec![
+                        run_bind(),
                         (open_dir_key(), " open dir"),
                         ("⏎", " edit/pick/toggle"),
                         ("j/k", " navigate"),
@@ -237,9 +252,8 @@ pub fn render(
             }
         })
     } else if focused == FocusedArea::Instances {
-        Some(&[
-            (launch_key(), " launch"),
-            ("Esc", " kill"),
+        Some(vec![
+            run_bind(),
             (open_dir_key(), " open dir"),
             ("⏎", " content"),
             ("a", " add"),
@@ -253,7 +267,7 @@ pub fn render(
 
     if let Some(kb) = kb {
         let lines =
-            crate::tui::widgets::popups::keybind_lines_wrapped(kb, area.width.saturating_sub(2));
+            crate::tui::widgets::popups::keybind_lines_wrapped(&kb, area.width.saturating_sub(2));
         for line in lines {
             block = block.title_bottom(line);
         }
