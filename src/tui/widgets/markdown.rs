@@ -474,6 +474,12 @@ pub fn decode_image_frames(bytes: &[u8]) -> Result<DecodedAnimation, String> {
         return decode_animated(bytes, format);
     }
 
+    single_frame(bytes)
+}
+
+/// the non-animated shape of the result: one frame, so callers see the
+/// same type whether or not the bytes happened to animate.
+fn single_frame(bytes: &[u8]) -> Result<DecodedAnimation, String> {
     let decoded = decode_still_or_svg(bytes)?;
     Ok(DecodedAnimation {
         first: decoded.clone(),
@@ -489,9 +495,18 @@ fn decode_animated(bytes: &[u8], format: image::ImageFormat) -> Result<DecodedAn
             .map_err(|error| format!("failed to read GIF: {error}"))?
             .into_frames(),
         image::ImageFormat::WebP => {
-            image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
-                .map_err(|error| format!("failed to read WebP: {error}"))?
-                .into_frames()
+            let decoder = image::codecs::webp::WebPDecoder::new(std::io::Cursor::new(bytes))
+                .map_err(|error| format!("failed to read WebP: {error}"))?;
+            // a *static* WebP is not an animation with zero frames, it is a
+            // still: image-webp reports num_frames == 0 for it, so
+            // into_frames() yields nothing and the old code turned every
+            // one of them into an "animation contained no frames" error.
+            // that broke the entire Modrinth gallery, whose thumbnails are
+            // all static `_350.webp` files. take the still path instead.
+            if !decoder.has_animation() {
+                return single_frame(bytes);
+            }
+            decoder.into_frames()
         }
         _ => return Err("unsupported animation format".to_owned()),
     };
@@ -536,7 +551,15 @@ fn decode_animated(bytes: &[u8], format: image::ImageFormat) -> Result<DecodedAn
     }
 
     let Some(first) = frames.first().cloned() else {
-        return Err("animation contained no frames".to_owned());
+        // belt and braces: any decoder that claims to animate but hands
+        // back nothing at all is still a valid image, so show it rather
+        // than report a failure the author can do nothing about.
+        tracing::debug!(
+            "animation decoder returned no frames for {} bytes of {:?}; falling back to the still path",
+            bytes.len(),
+            format
+        );
+        return single_frame(bytes);
     };
     Ok(DecodedAnimation {
         first,

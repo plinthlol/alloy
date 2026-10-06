@@ -8,7 +8,7 @@
 // images included. opened from the browse popups with Enter on a search
 // result; `v` opens the version list instead (the old Enter behavior).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use image::DynamicImage;
@@ -67,6 +67,11 @@ pub struct DescriptionState {
     // but input can fire before the first render — hence the default).
     pub gallery_cols: usize,
     pub preview_open: bool,
+    // urls whose fetch/decode already failed. the grid has no third state
+    // without it: a cell whose image is never coming would otherwise spin
+    // on "loading..." forever, which reads as "still working" and hides the
+    // real failure.
+    pub gallery_failed: HashSet<String>,
     gallery_protocols: HashMap<String, StatefulProtocol>,
 }
 
@@ -87,6 +92,7 @@ impl Default for DescriptionState {
             gallery_scroll_row: 0,
             gallery_cols: 1,
             preview_open: false,
+            gallery_failed: HashSet::new(),
             gallery_protocols: HashMap::new(),
         }
     }
@@ -151,28 +157,7 @@ pub fn open(source: DescriptionSource, fallback_title: &str) {
     tracing::info!("Description open requested for {}", source.key());
     let fallback_title = fallback_title.to_string();
     let key = source.key();
-    let request_id = {
-        let mut state = lock_state();
-        state.request_id = state.request_id.wrapping_add(1);
-        state.open = true;
-        state.source_key = key.clone();
-        state.title = fallback_title.to_string();
-        state.document = None;
-        state.error = None;
-        state.scroll = 0;
-        state.max_scroll = 0;
-        // the previous project's gallery state must not leak into the new
-        // one while the fetch is in flight: render_content checks
-        // gallery_open before the loading state, so a stale `true` would
-        // show the old project's grid over the new "Loading...".
-        state.gallery = Vec::new();
-        state.gallery_open = false;
-        state.gallery_idx = 0;
-        state.gallery_scroll_row = 0;
-        state.gallery_cols = 1;
-        state.preview_open = false;
-        state.request_id
-    };
+    let request_id = begin_request(&key, &fallback_title);
     // dedicated OS thread with its own single-thread runtime instead of
     // tokio::spawn: the TUI event loop blocks a worker with crossterm's
     // 16ms poll and never yields, and on 2-core machines spawned tasks were
@@ -191,6 +176,34 @@ pub fn open(source: DescriptionSource, fallback_title: &str) {
         })
         .expect("description fetch thread");
     tracing::info!("Description fetch thread started");
+}
+
+// claims the popup for `key` and drops everything the previous project
+// left behind, returning the new request id. split out of open() so the
+// reset is testable without spawning the fetch thread (and its network
+// call) that follows it.
+fn begin_request(key: &str, fallback_title: &str) -> u64 {
+    let mut state = lock_state();
+    state.request_id = state.request_id.wrapping_add(1);
+    state.open = true;
+    state.source_key = key.to_owned();
+    state.title = fallback_title.to_owned();
+    state.document = None;
+    state.error = None;
+    state.scroll = 0;
+    state.max_scroll = 0;
+    // the previous project's gallery state must not leak into the new
+    // one while the fetch is in flight: render_content checks
+    // gallery_open before the loading state, so a stale `true` would
+    // show the old project's grid over the new "Loading...".
+    state.gallery = Vec::new();
+    state.gallery_open = false;
+    state.gallery_idx = 0;
+    state.gallery_scroll_row = 0;
+    state.gallery_cols = 1;
+    state.preview_open = false;
+    state.gallery_failed.clear();
+    state.request_id
 }
 
 fn state_gallery_thumbs(gallery: &[GalleryItem]) -> impl Iterator<Item = String> + '_ {
@@ -418,14 +431,22 @@ async fn fetch(request_id: u64, key: String, source: DescriptionSource, fallback
             cache.insert((key.clone(), url.clone()), animation.first.clone());
         }
         apply(request_id, &key, |state| {
-            if let Some(document) = state.document.as_mut() {
-                match result.clone() {
-                    Ok(animation) => document.set_animated_image(&url, animation),
+            match &result {
+                Ok(animation) => {
+                    state.gallery_failed.remove(&url);
+                    if let Some(document) = state.document.as_mut() {
+                        document.set_animated_image(&url, animation.clone());
+                    }
+                }
+                Err(error) => {
                     // decode failures are indistinguishable from fetch
                     // failures here, and both just show the fallback icon
-                    Err(error) => {
+                    // in the body — but the grid must stop claiming the
+                    // image is on its way.
+                    state.gallery_failed.insert(url.clone());
+                    if let Some(document) = state.document.as_mut() {
                         tracing::debug!("Failed to decode project image {url}: {error}");
-                        document.set_image(&url, Err(error));
+                        document.set_image(&url, Err(error.clone()));
                     }
                 }
             }
@@ -829,6 +850,13 @@ fn render_gallery(
                     let widget = StatefulImage::default().resize(Resize::Fit(None));
                     StatefulWidget::render(widget, image_area, frame.buffer_mut(), protocol);
                 }
+                // "loading..." for a url still in flight, and a plain
+                // failure label once we know it is never coming.
+                None if state.gallery_failed.contains(&thumb) => {
+                    Paragraph::new("no image")
+                        .style(Style::default().fg(theme2.error()))
+                        .render(image_area, frame.buffer_mut());
+                }
                 None => {
                     Paragraph::new("loading...")
                         .style(Style::default().fg(theme2.text_dim()))
@@ -889,6 +917,11 @@ fn render_preview(
             let widget = StatefulImage::default().resize(Resize::Fit(None));
             StatefulWidget::render(widget, image_area, frame.buffer_mut(), protocol);
         }
+        None if state.gallery_failed.contains(&raw) => {
+            Paragraph::new("no image")
+                .style(Style::default().fg(theme.error()))
+                .render(image_area, frame.buffer_mut());
+        }
         None => {
             Paragraph::new("loading...")
                 .style(Style::default().fg(theme.text_dim()))
@@ -914,4 +947,105 @@ fn render_preview(
         },
         frame.buffer_mut(),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    // DESCRIPTION_STATE is a process-global static; without serialisation,
+    // parallel tests would race between setting the gallery and render
+    // re-acquiring the mutex internally. same guard as new_instance's
+    // wizard snapshot tests.
+    static TEST_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn gallery_item(url: &str, title: &str) -> GalleryItem {
+        GalleryItem {
+            thumb: url.to_owned(),
+            raw: url.to_owned(),
+            title: title.to_owned(),
+            featured: false,
+        }
+    }
+
+    fn set_gallery(items: Vec<GalleryItem>, failed: &[&str]) {
+        let mut state = lock_state();
+        *state = DescriptionState::default();
+        state.open = true;
+        state.source_key = "modrinth:test-project".to_owned();
+        state.gallery_open = true;
+        state.gallery = items;
+        for url in failed {
+            state.gallery_failed.insert((*url).to_owned());
+        }
+    }
+
+    fn rendered_text() -> String {
+        let backend = TestBackend::new(80, 30);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        let picker = ratatui_image::picker::Picker::halfblocks();
+        terminal
+            .draw(|frame| render_content(frame, frame.area(), &picker))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    // a url whose fetch already failed must not sit on "loading..." for the
+    // rest of the session — that reads as "still coming" and is the only
+    // signal the popup gives about an image it has given up on.
+    #[test]
+    fn gallery_grid_distinguishes_a_failed_image_from_one_still_in_flight() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_gallery(
+            vec![
+                gallery_item("https://example.com/dead.webp", "dead"),
+                gallery_item("https://example.com/coming.webp", "coming"),
+            ],
+            &["https://example.com/dead.webp"],
+        );
+
+        let text = rendered_text();
+        assert!(
+            text.contains("no image"),
+            "the failed cell must say so, got:\n{text}"
+        );
+        assert!(
+            text.contains("loading..."),
+            "the in-flight cell must still say it is loading, got:\n{text}"
+        );
+
+        lock_state().open = false;
+    }
+
+    // opening a different project must not inherit the last one's failures.
+    #[test]
+    fn begin_request_clears_the_previous_projects_gallery_failures() {
+        let _serial = TEST_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        set_gallery(
+            vec![gallery_item("https://example.com/dead.webp", "dead")],
+            &["https://example.com/dead.webp"],
+        );
+
+        let request_id = begin_request("modrinth:no-such-project", "No Such Project");
+
+        let state = lock_state();
+        assert!(
+            state.gallery_failed.is_empty(),
+            "gallery failures belong to the previous project"
+        );
+        assert!(state.gallery.is_empty(), "gallery itself must reset too");
+        assert_eq!(state.source_key, "modrinth:no-such-project");
+        assert_eq!(request_id, state.request_id);
+        drop(state);
+
+        lock_state().open = false;
+    }
 }

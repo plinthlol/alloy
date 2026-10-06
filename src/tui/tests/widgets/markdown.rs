@@ -202,6 +202,52 @@ fn decode_image_frames_reports_a_still_png_as_one_frame() {
     assert_eq!((animation.first.width(), animation.first.height()), (6, 4));
 }
 
+// --- static webp -----------------------------------------------------------
+
+// a real, *non-animated* webp. this is the shape of every Modrinth gallery
+// thumbnail (`<hash>_350.webp`), which is why getting it wrong blanks the
+// entire grid.
+fn static_webp_bytes(width: u32, height: u32) -> Vec<u8> {
+    let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        width,
+        height,
+        image::Rgba([12, 200, 90, 255]),
+    ));
+    let mut bytes = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut bytes, image::ImageFormat::WebP)
+        .expect("webp encodes");
+    bytes.into_inner()
+}
+
+#[test]
+fn decode_image_frames_reports_a_still_webp_as_one_frame() {
+    // regression: a static WebP reports num_frames == 0, so the animation
+    // decoder yields nothing at all. this used to come back as
+    // Err("animation contained no frames"), which marked every gallery
+    // thumbnail failed and left the grid on "loading..." forever.
+    let bytes = static_webp_bytes(8, 6);
+    assert!(
+        matches!(image::guess_format(&bytes), Ok(image::ImageFormat::WebP)),
+        "the fixture really is a webp"
+    );
+
+    let animation = decode_image_frames(&bytes).expect("static webp decodes");
+    assert_eq!(animation.frames.len(), 1);
+    assert!(!animation.is_animated());
+    assert_eq!(
+        (animation.first.width(), animation.first.height()),
+        (8, 6),
+        "dimensions must survive the still fallback"
+    );
+}
+
+#[test]
+fn decode_image_still_entry_point_handles_a_static_webp() {
+    let decoded = decode_image(&static_webp_bytes(5, 5)).expect("static webp decodes");
+    assert_eq!((decoded.width(), decoded.height()), (5, 5));
+}
+
 #[test]
 fn gif_frame_delays_are_clamped_to_a_playable_floor() {
     use image::codecs::gif::GifEncoder;
