@@ -1,49 +1,28 @@
-# Builds both the alloysh (TUI) and alloyctl (CLI) binaries for Linux, macOS,
-# and Windows, strips them down, UPX-compresses them, and attaches the artifacts
-# to a GitHub Release.
-#
-#   - Linux   : fully static musl build (zero runtime dependencies), stripped, UPX
-#               + Go binary (statically linked by default), stripped, UPX
-#   - macOS   : universal binary (Intel + Apple Silicon via lipo), stripped, UPX
-#               + Go universal2 binary, stripped, UPX
-#   - Windows : MSVC build (the release profile already strips symbols), UPX
-#               + Go binary, UPX
-#
-# Trigger: run manually from the Actions tab (Actions -> "Release binary" ->
-# Run workflow). Provide a version like v0.1.0 to also create a GitHub
-# Release with the binaries attached; leave it empty to just build artifacts.
-#
-# NOTE: this file is named release-binary.yml on purpose — cargo-dist
-# (dist-workspace.toml) generates its own .github/workflows/release.yml, so a
-# differently-named file keeps the two pipelines from clobbering each other.
-
 name: Release binary
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Release tag to publish under (e.g. v0.1.0). Leave empty to just build artifacts without creating a release."
+        description: "Release tag to publish under"
         required: false
         default: ""
 
 permissions:
-  contents: write # softprops/action-gh-release creates the Release + uploads
+  contents: write 
 
 jobs:
   build:
     name: alloysh + alloyctl (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
-      fail-fast: false # a failure on one OS shouldn't cancel the others
+      fail-fast: false 
       matrix:
         include:
           - name: linux-x86_64
             os: ubuntu-latest
             rust-target: x86_64-unknown-linux-musl
             extra-targets: x86_64-unknown-linux-musl
-            # crt-static is the default for musl; setting it explicitly makes
-            # the "no dynamic dependencies" guarantee visible in the flags.
             rustflags: "-C target-feature=+crt-static"
             tui-release: alloysh-linux-x86_64
             cli-release: alloyctl-linux-x86_64
