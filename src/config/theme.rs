@@ -103,9 +103,11 @@ fn ensure_theme_exists(path: &Path) {
 fn resolve_app_theme(config: &ThemeConfig) -> Box<dyn Theme> {
     let base = load_base_theme(&config.theme);
 
-    let Some(overrides) = &config.custom else {
-        return base;
-    };
+    // surface (stripes, popups, status bar, code blocks) defaults to the
+    // background color instead of the theme's own surface (ANSI black in
+    // the terminal theme), so nothing is drawn darker than the background.
+    let default_overrides = ThemeOverrides::default();
+    let overrides = config.custom.as_ref().unwrap_or(&default_overrides);
 
     Box::new(CustomTheme {
         name: format!("{} (customized)", base.name()),
@@ -127,7 +129,7 @@ fn resolve_app_theme(config: &ThemeConfig) -> Box<dyn Theme> {
             .diff_context
             .unwrap_or_else(|| base.diff_context()),
         border: overrides.border.unwrap_or_else(|| base.border()),
-        surface: overrides.surface.unwrap_or_else(|| base.surface()),
+        surface: overrides.surface.unwrap_or_else(|| base.background()),
         background: overrides.background.unwrap_or_else(|| base.background()),
     })
 }

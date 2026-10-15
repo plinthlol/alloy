@@ -36,7 +36,9 @@ pub async fn show() -> color_eyre::Result<()> {
             std::io::stdout(),
             crossterm::event::PopKeyboardEnhancementFlags
         );
+        reset_keyboard_protocol();
         ratatui::restore();
+        reset_keyboard_protocol();
         default_hook(info);
     }));
 
@@ -110,8 +112,15 @@ pub async fn show() -> color_eyre::Result<()> {
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags
     );
+    reset_keyboard_protocol();
 
     ratatui::restore();
+
+    // the keyboard-protocol stack is tracked per screen by some terminals
+    // (and implemented loosely by others), so clear it again on the main
+    // screen. otherwise the shell can be left receiving CSI-u key reports
+    // (Enter arrives as an escape sequence and commands never run).
+    reset_keyboard_protocol();
 
     // config.toml is read once at startup (see config::SETTINGS), so the
     // only way to apply settings-screen edits is a fresh process — and only
@@ -121,6 +130,16 @@ pub async fn show() -> color_eyre::Result<()> {
     }
 
     result
+}
+
+// force the kitty keyboard protocol back to its default state: set flags to
+// 0, then pop any entries still on the stack (popping an empty stack is a
+// no-op). harmless on terminals that don't support the protocol.
+fn reset_keyboard_protocol() {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(b"\x1b[=0;1u\x1b[<9u");
+    let _ = out.flush();
 }
 
 // writes the just-detected protocol into config.toml when it differs from
